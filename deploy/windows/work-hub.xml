@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Template: `npm run setup` fills the __PLACEHOLDERS__ into data/deploy/ (UTF-16, as schtasks expects) and prints the
+  install commands (docs/setup.md). Task Scheduler task: starts the hub at logon, restarts it a minute after it fails.
+  NOT YET TRIED ON A WINDOWS MACHINE: that conhost.exe headless hides the console window; that
+  RestartOnFailure fires when node exits with an error; the cmd quoting with a node path that has spaces.
+  If a console window shows, ask in the PR; closing it stops the hub.
+  Logs:    data\work-hub.log (node writes one JSON line per event; cmd appends it there)
+  Restart (needed after a code change or git pull), in PowerShell. Ending the task likely stops only conhost, not the
+  node under it, so stop node itself; cmd and conhost then exit with it:
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -like '*src\main.ts*' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    schtasks /Run /TN work-hub
+  Remove:  the Stop-Process line above, then schtasks /Delete /TN work-hub /F
+  ExecutionTimeLimit PT0S: the default (72 hours) would stop the hub after three days.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>work-hub: pages and collectors on 127.0.0.1:8787</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>__USER__</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%SystemRoot%\System32\conhost.exe</Command>
+      <Arguments>--headless %SystemRoot%\System32\cmd.exe /d /c ""__NODE__" --env-file-if-exists=.env src\main.ts &gt;&gt; data\work-hub.log 2&gt;&amp;1"</Arguments>
+      <WorkingDirectory>__REPO__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

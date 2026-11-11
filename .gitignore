@@ -1,0 +1,9 @@
+node_modules/
+# per person: hub.db, keys the hub makes (bridge.key, csrf.secret, vapid.json), config.json, the built extension
+data/
+.env
+# the owner's own plan and research (revenue figures), backups left by design tools, personal agent notes
+docs/private/
+.hallmark/
+CLAUDE.local.md
+.claude/settings.local.json

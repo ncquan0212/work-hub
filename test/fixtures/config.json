@@ -1,0 +1,111 @@
+{
+  "modules": [
+    "develop",
+    "jira",
+    "report",
+    "track",
+    "agents",
+    "repos",
+    "crash",
+    "rc",
+    "market",
+    "consoles",
+    "bridge",
+    "notify",
+    "gmail",
+    "listing"
+  ],
+  "apps": [
+    {
+      "key": "xremote",
+      "name": "XRemote",
+      "pkg": "com.example.xremote",
+      "repo": "xremote-tv-remote",
+      "gradle": "app/build.gradle.kts",
+      "rcKey": "xremote-rc-access.json",
+      "appId": "1:000000000001:android:0000000000000001",
+      "playDev": "1000000000000000001",
+      "playAccount": "Studio A",
+      "storeTitle": "XRemote",
+      "feedbackSubject": "Feedback XRemote|XRemote: Universal TV Remote"
+    },
+    {
+      "key": "idol",
+      "name": "Idol Call",
+      "pkg": "com.example.idol",
+      "repo": "idol-call/idol-call",
+      "gradle": "app/build.gradle.kts",
+      "rcKey": "idol-rc-access.json",
+      "appId": "1:000000000002:android:0000000000000002",
+      "playDev": "1000000000000000002",
+      "playAccount": "Studio B",
+      "storeTitle": "Live Idol",
+      "feedbackSubject": "Feedback Prank Idol|Prank Idol Video Call"
+    },
+    {
+      "key": "brain",
+      "name": "Brainova",
+      "pkg": "com.example.brain",
+      "repo": "brain-training",
+      "gradle": "android/app/build.gradle",
+      "pbxproj": "ios/BrainTraining.xcodeproj/project.pbxproj",
+      "infoPlist": "BrainTraining/Info.plist",
+      "rcKey": "brain-rc-access.json",
+      "appId": "1:000000000003:android:0000000000000003",
+      "playDev": "1000000000000000003",
+      "playAccount": "Studio C",
+      "storeTitle": "Brainova",
+      "feedbackSubject": "User Feedback - Brainova|Brainova"
+    },
+    {
+      "key": "xcast",
+      "name": "XCast",
+      "pkg": "com.example.xcast",
+      "repo": "xcast-and",
+      "gradle": "app/build.gradle.kts",
+      "rcKey": "xcast-rc-access.json",
+      "appId": "1:000000000004:android:0000000000000004",
+      "playDev": "1000000000000000001",
+      "playAccount": "Studio A",
+      "storeTitle": "XCast",
+      "feedbackSubject": "Feedback XCast|XCast: TV Cast"
+    }
+  ],
+  "repos": [
+    {
+      "key": "market",
+      "name": "market-tool",
+      "repo": "market-tool"
+    }
+  ],
+  "access": {
+    "tailnetHost": "hub.example.ts.net",
+    "devices": {
+      "Phone": [
+        "100.64.0.1",
+        "fd7a:115c:a1e0::1"
+      ]
+    }
+  },
+  "chromeBrowsers": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Chrome test 1"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "Chrome test 2"
+    }
+  ],
+  "chromeNote": "Play Console ở profile thứ nhất.",
+  "chromeProfiles": {
+    "falcon": "Chrome (tài khoản công ty)",
+    "publisher": "Chrome (hộp thư publisher)"
+  },
+  "jiraHost": "https://jira.example.com",
+  "chromeDomains": {
+    "example.com": "falcon",
+    "example.org": "publisher"
+  },
+  "databucketsDataset": "com.example.dataset"
+}

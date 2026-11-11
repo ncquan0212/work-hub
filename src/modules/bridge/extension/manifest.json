@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "work-hub bridge",
+  "description": "Lets your work-hub (on this computer) read allow-listed pages with this profile's login. Read-only: GET and page text, no clicks.",
+  "version": "1.0.0",
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "alarms",
+    "tabs",
+    "scripting",
+    "identity",
+    "identity.email"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8788/*",
+    "https://mail.google.com/*",
+    "https://play.google.com/*",
+    "https://admob.google.com/*"
+  ]
+}

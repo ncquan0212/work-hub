@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: `npm run setup` fills the __PLACEHOLDERS__ into data/deploy/ and prints the install commands (docs/setup.md).
+  launchd user agent: runs the hub 24/7 on 127.0.0.1:8787 (decisions.md D5).
+  Status:  launchctl print gui/$(id -u)/com.work-hub | grep -E '^\s+(state|pid|last exit code)'
+  Logs:    tail -f ~/Library/Logs/work-hub.log
+  Restart: launchctl kickstart -k gui/$(id -u)/com.work-hub      (needed after a code change or git pull)
+  Remove:  launchctl bootout gui/$(id -u)/com.work-hub; rm ~/Library/LaunchAgents/com.work-hub.plist
+  A user agent runs only while you are logged in. Paths are absolute: launchd expands neither ~ nor $HOME.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.work-hub</string>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <!-- LOAD-BEARING: a Mac may idle-sleep after a minute; caffeinate keeps the hub reachable. exec makes the PID node's. -->
+    <string>/usr/bin/caffeinate -i -w $$ &amp; exec "__NODE__" --env-file-if-exists=.env src/main.ts</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd's PATH lacks Homebrew; git and the tailscale/launchctl probes need your shell's PATH -->
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/work-hub.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/work-hub.log</string>
+</dict>
+</plist>

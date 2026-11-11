@@ -1,0 +1,20 @@
+# Template: `npm run setup` fills the __PLACEHOLDERS__ into data/deploy/ and prints the install commands (docs/setup.md).
+# systemd user service: runs the hub 24/7 on 127.0.0.1:8787 (decisions.md D5).
+#   Status:  systemctl --user status work-hub
+#   Logs:    journalctl --user -u work-hub -f
+#   Restart: systemctl --user restart work-hub      (needed after a code change or git pull)
+#   Remove:  systemctl --user disable --now work-hub; rm ~/.config/systemd/user/work-hub.service
+# Without `loginctl enable-linger` a user service stops when you log out.
+[Unit]
+Description=work-hub: pages and collectors on 127.0.0.1:8787
+
+[Service]
+WorkingDirectory=__REPO__
+ExecStart="__NODE__" --env-file-if-exists=.env src/main.ts
+# a user service gets a bare PATH; git and the probes need your shell's
+Environment="PATH=__PATH__"
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target

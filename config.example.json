@@ -1,0 +1,43 @@
+{
+  "modules": [
+    "develop",
+    "agents",
+    "repos",
+    "notify",
+    "report",
+    "track",
+    "crash",
+    "rc",
+    "listing"
+  ],
+  "codeDir": "~/Code",
+  "rcKeyDir": "~/Code/tv-rc",
+  "apps": [
+    {
+      "key": "myapp",
+      "name": "My App",
+      "pkg": "com.example.myapp",
+      "repo": "my-app",
+      "gradle": "app/build.gradle.kts",
+      "appId": "1:000000000000:android:0000000000000000",
+      "rcKey": "myapp-rc-access.json"
+    }
+  ],
+  "repos": [
+    {
+      "key": "tools",
+      "name": "my-tools",
+      "repo": "my-tools"
+    }
+  ],
+  "access": {
+    "tailnetHost": "",
+    "devices": {}
+  },
+  "chromeBrowsers": [],
+  "chromeProfiles": {},
+  "databucketsDataset": "",
+  "jiraHost": "",
+  "chromeDomains": {},
+  "ai": "claude"
+}

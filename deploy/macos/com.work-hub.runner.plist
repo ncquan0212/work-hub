@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: `npm run setup` fills the __PLACEHOLDERS__ into data/deploy/ and prints the install commands (docs/setup.md).
+  launchd user agent: the Develop runner (src/runner/main.ts), a separate service from the hub so that
+  restarting the hub never kills an AI turn. It runs the turns queued from the Develop board.
+  It must run in your GUI session: Claude Code's login lives in the login keychain.
+  Status:   launchctl print gui/$(id -u)/com.work-hub.runner | grep -E '^\s+(state|pid|last exit code)'
+  Logs:     tail -f ~/Library/Logs/work-hub-runner.log
+  Restart:  launchctl kickstart -k gui/$(id -u)/com.work-hub.runner   (a running turn is marked failed; resend it)
+  Remove:   launchctl bootout gui/$(id -u)/com.work-hub.runner; rm ~/Library/LaunchAgents/com.work-hub.runner.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.work-hub.runner</string>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <!-- no .env here on purpose: the hub's tokens must not reach Develop turns -->
+    <string>src/runner/main.ts</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd's PATH lacks Homebrew and ~/.local/bin; claude and its tools (git, rg, node) need them -->
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/work-hub-runner.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/work-hub-runner.log</string>
+</dict>
+</plist>

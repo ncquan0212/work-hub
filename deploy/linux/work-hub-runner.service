@@ -1,0 +1,21 @@
+# Template: `npm run setup` fills the __PLACEHOLDERS__ into data/deploy/ and prints the install commands (docs/setup.md).
+# systemd user service: the Develop runner (src/runner/main.ts), separate from the hub so that restarting the hub
+# never kills an AI turn.
+#   Status:  systemctl --user status work-hub-runner
+#   Logs:    journalctl --user -u work-hub-runner -f
+#   Restart: systemctl --user restart work-hub-runner   (a running turn is marked failed; resend it)
+#   Remove:  systemctl --user disable --now work-hub-runner; rm ~/.config/systemd/user/work-hub-runner.service
+[Unit]
+Description=work-hub runner: Develop turns
+
+[Service]
+WorkingDirectory=__REPO__
+# no .env here on purpose: the hub's tokens must not reach Develop turns
+ExecStart="__NODE__" src/runner/main.ts
+# claude and its tools (git, rg, node) need your shell's PATH
+Environment="PATH=__PATH__"
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
