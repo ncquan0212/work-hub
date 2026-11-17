@@ -7,13 +7,13 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
-import { APPS, CHROME_BROWSERS, DATA, HOME, RC_DIR, rcKeyPath, REPOS } from '../src/config.ts'
+import { APPS, CHROME_BROWSERS, DATA, HOME, RC_DIR, rcKeyPath, REPOS, WORKTREES } from '../src/config.ts'
 import { openDb } from '../src/core/db.ts'
 import type { Req, View } from '../src/core/types.ts'
 import { develop, steps } from '../src/modules/develop/index.ts'
 import { projectDir, rulePath } from '../src/lib/claude.ts'
 import { ai, parseMode, SYSTEM_RULES } from '../src/modules/develop/prompts.ts'
-import { addMessage, composeState, createTask, getTask, initStore, messages, openTurn, queueTurn, requestCancel, turns, type RunMode, type Task, type Turn } from '../src/modules/develop/store.ts'
+import { addMessage, commandsFor, composeState, contextShare, createTask, saveCommands, saveContext, getTask, initStore, messages, openTurn, queueTurn, requestCancel, turns, type RunMode, type Task, type Turn } from '../src/modules/develop/store.ts'
 import { guard, markerFile } from '../src/runner/chrome-guard.ts'
 import { Runner } from '../src/runner/runner.ts'
 
@@ -83,6 +83,8 @@ function run(content) {
     require('fs').writeFileSync('NEW.txt', 'x')
   }
   if (prompt.includes('FAIL')) { out({ type: 'result', subtype: 'error_during_execution', is_error: true, total_cost_usd: 1 }); process.exit(1) }
+  // the weekly limit: a "success" result that is an error, its text the reason (turn 221, 2026-11-12)
+  if (prompt.includes('LIMIT')) { out({ type: 'result', subtype: 'success', is_error: true, total_cost_usd: 1, result: "You've hit your weekly limit" }); process.exit(1) }
   if (prompt.includes('IMG')) return res('images=' + images, 0.1)
   if (prompt.includes('BG')) { // a background job outlives the first turn; its completion starts a second one (cost is a running total)
     out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'w1' }] }); res('đang chạy workflow', 0.25)
@@ -234,6 +236,9 @@ test('runner: discuss, resume, execute in a worktree and in the main tree, failu
     await Promise.all(runner.tick())
     assert.equal(turns(db, id).at(-1)!.status, 'failed')
     assert.match(messages(db, id).at(-1)!.text, /Lượt chạy lỗi \(error_during_execution\)/)
+    queueTurn(db, id, 'discuss', 'LIMIT please')
+    await Promise.all(runner.tick())
+    assert.match(messages(db, id).at(-1)!.text, /Lượt chạy lỗi \(You've hit your weekly limit\)/, 'the reason, not "success"')
     assert.match(await runner.diffSummary(join(dir, 'gone'), [join(dir, 'gone', 'a.txt')]), /Không đọc được diff/, 'a folder gone: a line, not a throw')
     assert.equal(getTask(db, id)!.status, 'awaiting')
 
@@ -295,6 +300,19 @@ test('model names: the version a choice really ran as, from claude\'s init event
   assert.equal(modelChoice('fable'), 'Fable 5.1', 'static label before any run')
   assert.equal(modelChoice('fable', new Map([['fable', 'claude-fable-5-2']])), 'Fable 5.2', 'an alias that moved shows its new version')
   assert.equal(modelChoice(null, new Map([['default', 'claude-opus-5-5']])), 'Opus 5.5')
+})
+
+test('deny rules: a discussion edits no repo and no worktree; an execution any repo, or only its own worktree', () => {
+  const t = { session_started: 0, session_id: 's', model: null, effort: null, ultracode: 0, chrome: 0, isolated: 0, worktree: null } as unknown as Task
+  const trees = REPOS.map(r => `Edit(${rulePath(resolve(r.repo))}/**)`), worktrees = `Edit(${rulePath(resolve(WORKTREES))}/**)`
+  const denied = (a: string[]) => a.slice(a.indexOf('--disallowedTools') + 1, a.indexOf('--output-format'))
+  const discuss = denied(ai.turnArgs(t, 'discuss', [])), execute = denied(ai.turnArgs(t, 'execute', []))
+  const iso = denied(ai.turnArgs({ ...t, isolated: 1 } as Task, 'execute', []))
+  assert.ok(trees.length >= 2)
+  for (const r of [...trees, worktrees, 'Edit(./**)']) assert.ok(discuss.includes(r), `discussion: ${r}`)
+  for (const r of [...trees, worktrees]) assert.ok(!execute.includes(r), `execution: ${r}`)
+  for (const r of trees) assert.ok(iso.includes(r), `own worktree: ${r} read-only`)
+  assert.ok(!iso.includes(worktrees), 'its own worktree stays writable')
 })
 
 test('run mode: flags for model, thinking and ultracode; none by default', () => {
@@ -393,4 +411,205 @@ test('Dừng stops the running turn and keeps the replies sent during it; the pa
   assert.deepEqual(turns(db, b).map(t => t.status), ['cancelled', 'cancelled'])
   assert.match(messages(db, b).at(-1)!.text, /huỷ cả 1 tin đang chờ/)
   db.close()
+})
+
+// claude's output for commands, as probed 2026-11-16 (plan §12): /context is answered locally and never echoed, /compact
+// is echoed but says nothing of its own and may show an old message again, a skill is echoed as its expansion
+const FAKE_COMMANDS = `#!/usr/bin/env node
+const out = o => console.log(JSON.stringify(o))
+const args = process.argv.slice(2), sid = args[args.indexOf(args.includes('--resume') ? '--resume' : '--session-id') + 1]
+const mode = args.includes('Edit(./**)') ? 'discuss' : 'execute'
+const say = (text, used) => out({ type: 'assistant', parent_tool_use_id: null, message: { model: 'claude-opus-5-5', content: [{ type: 'text', text }], usage: { input_tokens: 10, cache_read_input_tokens: used - 10, cache_creation_input_tokens: 0 } } })
+const res = text => out({ type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.1, session_id: sid, result: text,
+  modelUsage: { 'claude-opus-5-5': { contextWindow: 1000000 }, 'claude-haiku-4-5-20251001': { contextWindow: 200000 } } })
+out({ type: 'system', subtype: 'init', session_id: sid, model: 'claude-opus-5-5' })
+out({ type: 'system', subtype: 'commands_changed', commands: [{ name: 'compact', description: 'Free up context', argumentHint: '<instructions>' }, { name: 'doctor', description: 'terminal only' }, { name: 'simplify', description: 'Review the changed code' }] })
+let buf = '', held = null // while a background job runs, claude holds a command until the turn it is in ends
+process.stdin.on('data', d => {
+  buf += d
+  for (let i; (i = buf.indexOf('\\n')) >= 0; buf = buf.slice(i + 1)) take(JSON.parse(buf.slice(0, i)).message.content)
+})
+function take(text) {
+    if (held && text.startsWith('/')) return held.push(text)
+    if (text === 'JOB') {
+      out({ type: 'user', isReplay: true, message: { content: text } })
+      out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'w1' }] }); res('chờ việc nền'); held = []
+      return setTimeout(() => {
+        out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] }); say('báo cáo việc nền', 70010); res('báo cáo việc nền')
+        const h = held; held = null; setTimeout(() => h.forEach(take), 100) // it takes them a moment after the report
+      }, 400)
+    }
+    if (text === 'AUTO') { // a long turn: claude compacts by itself near the limit and goes on working
+      out({ type: 'user', isReplay: true, message: { content: text } })
+      say('làm', 820000)
+      out({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto', pre_tokens: 820000, post_tokens: 9000 } })
+      say('làm tiếp', 90010); res('xong việc dài')
+      return
+    }
+    if (text === '/context') {
+      out({ type: 'assistant', parent_tool_use_id: null, local_command_source: '<local-command-stdout>## Context Usage', message: { model: '<synthetic>', content: [{ type: 'text', text: '## Context Usage' }], usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })
+      res('## Context Usage\\n**Tokens:** 60k / 1M')
+    } else if (text.startsWith('/compact')) {
+      out({ type: 'user', isReplay: true, message: { content: '<local-command-stdout>Compacted</local-command-stdout>' } })
+      out({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'manual', pre_tokens: 150000, post_tokens: 4000 } })
+      if (text !== '/compact') say('một tin cũ hiện lại', 149000) // a bare /compact shows nothing again: no text at all in its turn
+      res('')
+    } else if (text.startsWith('/')) {
+      out({ type: 'user', isReplay: true, message: { content: '<command-name>' + text.split(' ')[0] + '</command-name>' } })
+      say(mode + ' chạy ' + text, 60010); res(mode + ' chạy ' + text)
+    } else {
+      out({ type: 'user', isReplay: true, message: { content: text } })
+      say('đã đọc', 50010); res(text.includes('Tin kế tiếp là lệnh') ? 'đã đọc task' : 'trả lời thường')
+    }
+}
+process.stdin.on('end', () => process.exit(0))
+`
+
+test('runner: commands and skills as they are, the context and its size, /context and /compact end their turn', { skip: process.platform === 'win32' && 'the fake claude is a shebang script, which spawn cannot run on Windows' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-cmd-'))
+  try {
+    const repo = join(dir, 'repo'); execFileSync('git', ['init', '-q', repo])
+    const claude = join(dir, 'claude'); writeFileSync(claude, FAKE_COMMANDS); chmodSync(claude, 0o755)
+    const db = openDb(':memory:'); initStore(db)
+    // a hung turn would fail here in 3 s rather than time the test out
+    const runner = new Runner({ db, repos: [{ key: 't', name: 'Test', repo }], bin: claude, worktrees: join(dir, 'wt'), turnTimeoutMs: 3000 })
+    const claudeSaid = (id: number) => messages(db, id).filter(m => m.who === 'claude').map(m => m.text)
+
+    // the first message of a session is a skill: the task goes in first, then the skill as it is
+    const id = createTask(db, { title: 'Dọn code', body: 'Màn paywall', repo: 't' })
+    queueTurn(db, id, 'discuss', '/simplify')
+    await Promise.all(runner.tick())
+    assert.equal(turns(db, id).at(-1)!.status, 'done')
+    assert.deepEqual(claudeSaid(id), ['đã đọc task', 'discuss chạy /simplify'])
+    let t = getTask(db, id)!
+    assert.equal(t.context_used, 60010); assert.equal(t.context_window, 1000000, "the window of the model that answered, not the side model's")
+    assert.equal(contextShare(t), 0.06001)
+    assert.deepEqual(commandsFor(db, 't').map(c => c.name), ['compact', 'simplify'], 'terminal-only commands are not offered')
+    assert.deepEqual(commandsFor(db, 'other').map(c => c.name), ['compact', 'simplify'], 'a repo with no turn yet borrows the latest list')
+
+    // /context: answered without an echo, and the turn still ends; a local answer is no context figure
+    queueTurn(db, id, 'discuss', '/context')
+    await Promise.all(runner.tick())
+    assert.equal(turns(db, id).at(-1)!.status, 'done', '/context must not hang the turn')
+    assert.match(claudeSaid(id).at(-1)!, /^## Context Usage/)
+    assert.equal(getTask(db, id)!.context_used, 60010)
+
+    // /compact: says nothing itself, the turn ends, a line in the thread; the old message shown again is not taken
+    queueTurn(db, id, 'discuss', '/compact giữ quyết định')
+    await Promise.all(runner.tick())
+    assert.equal(turns(db, id).at(-1)!.status, 'done', '/compact must not hang the turn')
+    assert.match(messages(db, id).at(-1)!.text, /^Đã compact: trước đó context có 150k token/)
+    assert.ok(!claudeSaid(id).includes('một tin cũ hiện lại'), 'an old message shown again after compact is not a new reply')
+    t = getTask(db, id)!
+    assert.equal(t.context_used, 60010, 'nor its context figure'); assert.ok(t.compact_at); assert.equal(contextShare(t), null, 'compacted: no share until Claude answers again')
+
+    queueTurn(db, id, 'discuss', '/compact')
+    await Promise.all(runner.tick())
+    assert.equal(turns(db, id).at(-1)!.status, 'done', 'a compact that prints nothing else still ends the turn')
+
+    // a command sent while Claude waits on a background job is held by claude until the job's report turn ends: that
+    // report is not its ack (review 2026-11-16), the command still runs in the session and the turn ends
+    queueTurn(db, id, 'discuss', 'JOB')
+    const job = runner.tick()
+    for (let i = 0; i < 200 && !turns(db, id).at(-1)!.waiting; i++) await new Promise(r => setTimeout(r, 10))
+    queueTurn(db, id, 'discuss', '/context'); runner.tick()
+    await Promise.all(job)
+    assert.deepEqual(claudeSaid(id).slice(-3).map(s => s.slice(0, 16)), ['chờ việc nền', 'báo cáo việc nền', '## Context Usage'])
+    assert.deepEqual(turns(db, id).slice(-2).map(x => x.status), ['done', 'merged'], 'the command went into the session, nothing left to requeue')
+
+    // an automatic compact goes on working: the figures after it are new
+    queueTurn(db, id, 'discuss', 'AUTO')
+    await Promise.all(runner.tick())
+    t = getTask(db, id)!
+    assert.equal(t.context_used, 90010); assert.ok(contextShare(t), 'a new figure after an automatic compact')
+    assert.match(messages(db, id).find(m => m.text.startsWith('Claude tự compact'))!.text, /trước đó context có 820k token/)
+
+    // "Duyệt và làm" with a command as the note: the turn's message is the command as it is
+    queueTurn(db, id, 'execute', '/simplify')
+    await Promise.all(runner.tick())
+    assert.equal(claudeSaid(id).at(-1), 'execute chạy /simplify')
+    assert.ok(contextShare(getTask(db, id)!), 'a new answer brings the share back')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('page: the context figure, a warning from 75% on the task and its card, Compact, the "/" list; a command is sent as it is', async () => {
+  const db = openDb(':memory:'); initStore(db)
+  const id = createTask(db, { title: 'x', body: 'mô tả', repo: REPOS[0].key })
+  const v = { now: Date.now(), db, csrf: 'c', slot: () => undefined } as unknown as View
+  const route = (m: string, p: string) => develop.routes!.find(r => r.method === m && r.path === p)!
+  const req = (form = '') => ({ method: 'GET', path: '', params: { id: String(id) }, query: new URLSearchParams(), form: new URLSearchParams(form), files: [] }) as unknown as Req
+  const page = async () => (await route('GET', '/develop/task/:id').handle(req(), v) as { body: string }).body
+  let body = await page()
+  assert.match(body, /Context<\/span><span class="develop-hint">có số sau câu trả lời đầu tiên/)
+  assert.doesNotMatch(body, /value="\/compact"/, 'no session yet: nothing to compact')
+  assert.match(body, /id="compose-cmds" role="listbox"/); assert.match(body, /aria-controls="compose-cmds"/)
+
+  db.prepare('update develop_tasks set session_started = 1, context_used = 160000, context_window = 200000, context_at = ? where id = ?').run(Date.now(), id)
+  body = await page()
+  assert.match(body, /160k \/ 200k, 80%/); assert.match(body, /class="develop-bar develop-bar-warn" value="160000" max="200000"/)
+  assert.match(body, /<input type="hidden" name="text" value="\/compact"><button type="submit" class="ghost">Compact/)
+  assert.match(develop.panel!(undefined, v) as string, /Context 80%/, 'the card warns too')
+  db.prepare('update develop_tasks set context_used = 100000 where id = ?').run(id)
+  assert.doesNotMatch(develop.panel!(undefined, v) as string, /Context \d+%/, 'not under 75%')
+
+  // the reply box: a command goes as it is; plain text is still framed as the owner's words
+  const send = route('POST', '/develop/task/:id/send')
+  await send.handle({ ...req('text=/compact&mode=discuss'), method: 'POST' } as Req, v)
+  assert.equal(turns(db, id).at(-1)!.prompt, '/compact')
+  db.prepare(`update develop_turns set status = 'done'`).run()
+  await send.handle({ ...req('text=xem /context giúp&mode=discuss'), method: 'POST' } as Req, v)
+  assert.match(turns(db, id).at(-1)!.prompt, /^Owner trả lời[^]*xem \/context giúp/)
+  db.prepare(`update develop_turns set status = 'done'`).run()
+  const cmdTask = createTask(db, { title: 'Review', body: '/code-review high', repo: REPOS[0].key })
+  await send.handle({ ...req('text=chỉ xem Paywall.kt&mode=discuss'), params: { id: String(cmdTask) }, method: 'POST' } as unknown as Req, v)
+  assert.match(turns(db, cmdTask).at(-1)!.prompt, /^Task #\d+: Review[^]*"{3}\n\/code-review high\n"{3}[^]*chỉ xem Paywall\.kt/, 'framed: the reply is not taken as the arguments of the command')
+  // compacted: the old figure is from before, the page says so instead of a share
+  db.prepare('update develop_tasks set compact_at = ? where id = ?').run(Date.now() + 1, id)
+  assert.match(await page(), /Vừa compact, trước đó 100k/)
+
+  // another model answers (the run mode changed): no share until its size is known
+  db.prepare('update develop_tasks set compact_at = null, context_window = 200000, context_model = ? where id = ?').run('claude-haiku-5-5', id)
+  saveContext(db, id, 250000, 'claude-opus-5-5')
+  assert.equal(getTask(db, id)!.context_window, null); assert.equal(contextShare(getTask(db, id)!), null)
+  db.prepare('update develop_tasks set context_window = 1000000 where id = ?').run(id)
+  saveContext(db, id, 252000, 'claude-opus-5-5')
+  assert.equal(getTask(db, id)!.context_window, 1000000, 'the same model keeps its size')
+  // the "/" list: what claude listed for this repo, descriptions cut short
+  saveCommands(db, REPOS[0].key, [{ name: 'simplify', description: 'x'.repeat(300), hint: '' }])
+  const list = (await route('GET', '/develop/task/:id/commands').handle(req(), v) as { json: { name: string; description: string }[] }).json
+  assert.equal(list[0].name, 'simplify'); assert.ok(list[0].description.length <= 141)
+  db.close()
+})
+
+test('runner: an execution that wrote in another repo lists the changes of each repo', { skip: process.platform === 'win32' && 'the fake claude is a shebang script, which spawn cannot run on Windows' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-two-'))
+  try {
+    const repo = join(dir, 'xr'), other = join(dir, 'xc')
+    for (const r of [repo, other]) {
+      execFileSync('git', ['init', '-q', r]); writeFileSync(join(r, 'README.md'), 'hi')
+      execFileSync('git', ['-C', r, 'add', '.']); execFileSync('git', ['-C', r, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'])
+    }
+    // writes what the owner's note names: a file here, and one in the other repo (its path in the note)
+    const fake = `#!/usr/bin/env node
+const out = o => console.log(JSON.stringify(o)), fs = require('fs'), path = require('path')
+process.stdin.once('data', d => {
+  const text = JSON.parse(String(d).split('\\n')[0]).message.content
+  out({ type: 'user', isReplay: true, message: { content: text } })
+  const there = /TWO (\\S+)/.exec(text)[1], files = [path.join(process.cwd(), 'A.txt'), path.join(there, 'B.txt')]
+  for (const f of files) fs.writeFileSync(f, 'x')
+  out({ type: 'assistant', message: { content: files.map(f => ({ type: 'tool_use', name: 'Write', input: { file_path: f } })) } })
+  out({ type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.1, result: 'xong hai repo' })
+})
+process.stdin.on('end', () => process.exit(0))
+`
+    const claude = join(dir, 'claude'); writeFileSync(claude, fake); chmodSync(claude, 0o755)
+    const db = openDb(':memory:'); initStore(db)
+    const runner = new Runner({ db, repos: [{ key: 'xr', name: 'XRemote', repo }, { key: 'xc', name: 'XCast', repo: other }], bin: claude, worktrees: join(dir, 'wt'), turnTimeoutMs: 3000 })
+    const id = createTask(db, { title: 'Sửa cả hai', body: '', repo: 'xr' })
+    db.prepare('update develop_tasks set session_started = 1 where id = ?').run(id)
+    queueTurn(db, id, 'execute', `TWO ${other}`)
+    await Promise.all(runner.tick())
+    const diff = messages(db, id).at(-1)!.text
+    assert.match(diff, /theo repo:\n\nXRemote:\n[^]*File mới: A\.txt\n\nXCast:\n[^]*File mới: B\.txt$/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })

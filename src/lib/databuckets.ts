@@ -1,7 +1,7 @@
-// Databuckets through its MCP server, the only access that exists (owner rule R1). The server has one
-// tool, chat_with_agent: an LLM agent that runs the EQL we hand it. Facts measured 2026-11-08
-// (docs/sources.md, Databuckets):
-//  - ~100 s per call (58–175 s); the query itself is 1–44 s. No retry: a timed-out call may still run.
+// Databuckets through its MCP server, the only access that exists (owner rule R1). An LLM agent runs the EQL we hand
+// it: ask_db_agent starts a run and get_agent_progress is polled until it completes (since 2026-11-16; the single
+// chat_with_agent call it replaced is gone). Facts measured 2026-11-08 (docs/sources.md, Databuckets):
+//  - ~100 s per call (58–175 s; 1–4 min with the polled tools); the query itself is 1–44 s. No retry: a timed-out call may still run.
 //  - the reply prose is unstable (once in Chinese); the last ```json block ("Query results") is stable
 //    and carries the EQL that really ran, so we compare it with ours and refuse a rewritten query;
 //  - a result carries at most 1,000 rows; only the last step's rows come back;
@@ -10,11 +10,13 @@
 // read in place, never logged.
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { DATASET, HOME } from '../config.ts'
 import { NotConfigured } from '../core/types.ts'
 
 export { DATASET } from '../config.ts'
-const CALL_TIMEOUT = 300_000
+// the polled agent first loads its own guides: 1–4 min a run on 2026-11-16, against ~100 s for chat_with_agent
+const CALL_TIMEOUT = 600_000
 
 type Mcp = { url?: unknown; headers?: Record<string, unknown> } | undefined
 const fromMcp = (c: Mcp) => {
@@ -103,12 +105,18 @@ type Result = { data: unknown[][]; eql?: string; steps?: unknown[][]; rows?: num
 
 /** The "Query results" block at the end of an agent reply → one result per query that ran. */
 export function parseQueryResults(reply: string): Result[] {
-  const blocks = [...reply.matchAll(/```json\s*([\s\S]*?)```/g)]
-  if (!blocks.length) throw new Error('Databuckets: trả lời không có khối Query results')
-  const j = JSON.parse(blocks.at(-1)![1])
-  const list = (Array.isArray(j) ? j : [j]).filter(r => r && Array.isArray(r.data) && Array.isArray(r.data[0]))
-  if (!list.length) throw new Error('Databuckets: khối Query results không có bảng data')
-  return list
+  try {
+    const blocks = [...reply.matchAll(/```json\s*([\s\S]*?)```/g)]
+    if (!blocks.length) throw new Error('Databuckets: trả lời không có khối Query results')
+    const j = JSON.parse(blocks.at(-1)![1])
+    const list = (Array.isArray(j) ? j : [j]).filter(r => r && Array.isArray(r.data) && Array.isArray(r.data[0]))
+    if (!list.length) throw new Error('Databuckets: khối Query results không có bảng data')
+    return list
+  } catch (e) {
+    // say what the agent answered instead (its prose, trimmed): usually why it would not run the query. Here, not in
+    // the callers: Theo dõi's askAll had no such catch, so its failures said nothing (đợt #10, 2026-11-12)
+    throw new Error(`${(e as Error).message}. Agent trả lời: "${reply.replace(/\s+/g, ' ').slice(0, 300)}"`)
+  }
 }
 
 export type Row = Record<string, string | number | null>
@@ -121,13 +129,48 @@ export function toRows(data: unknown[][]): Row[] {
 
 export type Query = { eql: string; cols: string[] }
 
+const textJson = (res: any) => {
+  const text = res?.content?.find((c: any) => c?.type === 'text')?.text
+  if (!text) throw new Error('Databuckets: trả lời rỗng')
+  return JSON.parse(text)
+}
+
+/**
+ * One question to the Databuckets agent, waited for: ask_db_agent returns a run id at once, get_agent_progress is
+ * polled at the pace it asks for (pages of a run read back to back). Never resubmits: a run in any state but
+ * queued/running/completed (outcome_unknown, session_busy…) throws, since it may have run. Returns the agent's result
+ * ({ agent_run_failed, reply, … }, what chat_with_agent used to answer).
+ */
+export async function askAgent(s: { call(name: string, args: object): Promise<any> }, question: string, signal: AbortSignal, minWaitMs = 5_000) {
+  const start = textJson(await s.call('ask_db_agent', { user_question: question }))
+  const { run_id, session_id } = start
+  if (!run_id || !session_id) throw new Error(`Databuckets: ask_db_agent không trả run_id (${String(start.status ?? '?')})`)
+  let cursor: number | null = null, wait = Number(start.poll_after_seconds) * 1000, result: any = null
+  for (;;) {
+    await sleep(Math.max(minWaitMs, Number.isFinite(wait) ? wait : 10_000), undefined, { signal })
+    let p: any
+    do {
+      p = textJson(await s.call('get_agent_progress', { run_id, session_id, after_cursor: cursor }))
+      cursor = p.next_cursor ?? cursor
+      result = p.result ?? result
+    } while (p.has_more)
+    if (p.status === 'completed') {
+      if (!result) throw new Error('Databuckets: lượt chạy xong nhưng không có kết quả')
+      return result
+    }
+    if (p.status !== 'queued' && p.status !== 'running') throw new Error(`Databuckets: lượt chạy ở trạng thái ${String(p.status)}, không gửi lại`)
+    wait = Number(p.poll_after_seconds) * 1000
+  }
+}
+
 /**
  * Run EQL through the agent, exactly as written, in ONE chat call (each call costs ~100 s and a saved
  * chat on their side, so small queries share a call). Throws (no data at all) when the agent ran a
  * different query, returned a truncated result, missed a query, or failed.
  */
 export async function runEql(queries: Query[], signal: AbortSignal, timeoutMs = CALL_TIMEOUT) {
-  const s = await mcpSession(AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]))
+  const sig = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+  const s = await mcpSession(sig)
   const question = [
     'READ-ONLY: do not create, save, schedule, send or modify any report, dashboard, insight, alert or email.',
     queries.length === 1
@@ -139,16 +182,9 @@ export async function runEql(queries: Query[], signal: AbortSignal, timeoutMs = 
     'Reply with the Query results block only.',
     ...queries.flatMap((q, i) => [queries.length > 1 ? `Query ${i + 1}:` : '', '```', q.eql, '```']).filter(Boolean),
   ].join('\n')
-  const res = await s.call('chat_with_agent', { user_question: question })
-  const text = res?.content?.find((c: any) => c?.type === 'text')?.text
-  if (!text) throw new Error('Databuckets: trả lời rỗng')
-  const out = JSON.parse(text)
+  const out = await askAgent(s, question, sig)
   if (out.agent_run_failed) throw new Error(`Databuckets: agent lỗi: ${String(out.reply ?? '').slice(0, 160)}`)
-  let results: Result[]
-  try { results = parseQueryResults(String(out.reply ?? '')) } catch (e) {
-    // say what the agent answered instead (its prose, trimmed): usually why it would not run the query
-    throw new Error(`${(e as Error).message}. Agent trả lời: "${String(out.reply ?? '').replace(/\s+/g, ' ').slice(0, 300)}"`)
-  }
+  const results = parseQueryResults(String(out.reply ?? ''))
   return queries.map((q, i) => {
     const want = normEql(q.eql)
     const r = results.find(x => x.eql && normEql(x.eql) === want)

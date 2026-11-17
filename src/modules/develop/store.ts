@@ -17,7 +17,10 @@ export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancel' | '
 export type Task = {
   id: number; title: string; body: string; repo: string; status: TaskStatus; session_id: string; session_started: number
   worktree: string | null; branch: string | null; jira_key: string | null; cost_usd: number; created_at: number; updated_at: number
-} & RunMode
+} & RunMode & TaskContext
+/** The session's context as the runner last saw it (plan §12): tokens in it, the model's size, when; and the last compact
+ *  (after it, `context_used` is from before until Claude answers again). */
+export type TaskContext = { context_used: number | null; context_window: number | null; context_at: number | null; compact_at: number | null; context_model: string | null }
 /** How a task's turns run (architecture.md "Develop"). null / 0 = today's default; prompts.ts turns it into CLI flags. */
 export type RunMode = { model: string | null; effort: string | null; ultracode: number; chrome: number; isolated: number }
 export type Message = { id: number; task_id: number; at: number; who: 'owner' | 'claude' | 'system'; text: string }
@@ -53,11 +56,15 @@ export function initStore(db: DatabaseSync) {
     create table if not exists develop_files (id integer primary key, task_id integer not null references develop_tasks(id),
       message_id integer not null, mime text not null, path text not null, bytes integer not null, at integer not null);
     create table if not exists develop_runner (id integer primary key check (id = 1), pid integer not null, beat integer not null);
+    create table if not exists develop_commands (repo text not null, name text not null, description text not null, hint text not null,
+      at integer not null, primary key (repo, name));
   `)
   // columns added after the first release (2026-11-09: run mode, images). Hub and runner both run this: a lost race is harmless
   for (const [table, c, def] of [['develop_tasks', 'model', 'text'], ['develop_tasks', 'effort', 'text'], ['develop_tasks', 'ultracode', 'integer not null default 0'],
     ['develop_tasks', 'chrome', 'integer not null default 0'], ['develop_turns', 'files', 'text'], ['develop_tasks', 'isolated', 'integer not null default 0'],
-    ['develop_turns', 'waiting', 'integer not null default 0'], ['develop_turns', 'said', 'text'], ['develop_turns', 'model_used', 'text']]) {
+    ['develop_turns', 'waiting', 'integer not null default 0'], ['develop_turns', 'said', 'text'], ['develop_turns', 'model_used', 'text'],
+    ['develop_tasks', 'context_used', 'integer'], ['develop_tasks', 'context_window', 'integer'], ['develop_tasks', 'context_at', 'integer'], ['develop_tasks', 'compact_at', 'integer'],
+    ['develop_tasks', 'context_model', 'text']]) {
     const have = (db.prepare(`pragma table_info(${table})`).all() as { name: string }[]).some(x => x.name === c)
     if (!have) try { db.exec(`alter table ${table} add column ${c} ${def}`) } catch { /* added by the other process */ }
   }
@@ -120,6 +127,49 @@ export function noteModel(db: DatabaseSync, alias: string, model: string, now = 
 }
 export const resolvedModels = (db: DatabaseSync) =>
   new Map((db.prepare('select alias, model from develop_models').all() as { alias: string; model: string }[]).map(r => [r.alias, r.model]))
+
+/** 45102 → "45k", 1_000_000 → "1M", 800 → "800": token counts on the page and in the thread. */
+export const kTokens = (n: number) => n >= 999_500 ? `${+(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(Math.round(n))
+
+/** Context share from which the page warns (owner 2026-11-16): claude compacts by itself near 83% (its buffer is 16.5%). */
+export const CONTEXT_WARN = 0.75
+/** Compacted after the last figure: that figure is from before (noteCompact keeps the figure strictly older). */
+export const compactedSince = (t: TaskContext) => t.compact_at != null && t.compact_at > (t.context_at ?? 0)
+/** The share of the context in use, or null: nothing seen yet, or compacted since. */
+export const contextShare = (t: TaskContext) =>
+  t.context_used != null && t.context_window && !compactedSince(t) ? t.context_used / t.context_window : null
+
+/** The size saved is the model's that answered last: a turn on another model (the run mode changed) has no size until its
+ *  result brings it, rather than the old one ("250k / 200k, 125%" after Haiku → Opus; review 2026-11-16). */
+export function saveContext(db: DatabaseSync, taskId: number, used: number, model: string, now = Date.now()) {
+  db.prepare(`update develop_tasks set context_used = ?, context_at = ?, context_window = case when context_model is ? then context_window end, context_model = ?
+    where id = ?`).run(used, now, model, model, taskId)
+}
+export function saveWindow(db: DatabaseSync, taskId: number, tokens: number) {
+  db.prepare('update develop_tasks set context_window = ? where id = ?').run(tokens, taskId)
+}
+export function noteCompact(db: DatabaseSync, taskId: number, now = Date.now()) {
+  // the figure before it moves a millisecond back, so a new figure in the same millisecond still counts as after it
+  db.prepare('update develop_tasks set compact_at = ?, context_at = min(coalesce(context_at, ?), ?) where id = ?').run(now, now - 1, now - 1, taskId)
+}
+
+/** The commands and skills claude offers in a repo (its own .claude/ may add some), as its last process listed them. */
+export function saveCommands(db: DatabaseSync, repo: string, list: { name: string; description: string; hint: string }[], now = Date.now()) {
+  db.exec('begin')
+  try {
+    db.prepare('delete from develop_commands where repo = ?').run(repo)
+    const st = db.prepare('insert or replace into develop_commands (repo, name, description, hint, at) values (?, ?, ?, ?, ?)')
+    for (const c of list) st.run(repo, c.name, c.description, c.hint, now)
+    db.exec('commit')
+  } catch (e) { db.exec('rollback'); throw e }
+}
+/** A repo no turn has run in yet gets the latest list of another: the owner's own commands and skills are the same. */
+export function commandsFor(db: DatabaseSync, repo: string) {
+  const q = db.prepare('select name, description, hint from develop_commands where repo = ? order by name')
+  const own = q.all(repo) as { name: string; description: string; hint: string }[]
+  const other = own.length ? null : db.prepare('select repo from develop_commands order by at desc limit 1').get() as { repo: string } | undefined
+  return other ? q.all(other.repo) as typeof own : own
+}
 
 export const openTurn = (db: DatabaseSync, taskId: number) =>
   db.prepare(`select * from develop_turns where task_id = ? and status in ('queued', 'running', 'cancel') order by status = 'queued', id desc limit 1`).get(taskId) as Turn | undefined

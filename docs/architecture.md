@@ -103,6 +103,7 @@ Code dùng chung nằm trong `src/lib/`:
 | Vận hành | `repos` | git (`--no-optional-locks`) | 60 giây | Bật |
 | Vận hành | `crash` | Crashlytics 24h | 30 phút | Bật |
 | Vận hành | `rc` | Remote Config: version và tham số vừa đổi | 15 phút | Bật |
+| Vận hành | `segsync` | Databuckets (1 lần gọi), Remote Config: thêm campaign mới của một network vào một segment rồi **publish** (D27) | 07:05, cùng giờ Report | Tắt |
 | Vận hành | `market` | Log, state.db và launchd của market-tool (chỉ máy owner) | 60 giây | Tắt |
 | Vận hành | `consoles` | Play Console vitals và AdMob, đọc trang qua extension | 07:05, cùng giờ Report | Tắt |
 | Vận hành | `bridge` | Trạng thái extension, cổng 8788 | — | Tắt |
@@ -158,7 +159,10 @@ Cột "Mặc định" là `DEFAULT_MODULES` trong `src/config.ts`; module nào c
      khác (`stash`, `reset --hard`, `clean`, `checkout .`, `restore .`, `add -A`/`.`, D15); không đọc file bí mật
      (key RC là `*-access.json` trong `rcKeyDir`) và `data/` của bản hub này (đường dẫn tuyệt đối dựng từ `DATA`, nên
      đúng ở mọi chỗ clone); không publish RC (`rc.py … --yes`, `rc.py api`);
-     lượt trao đổi có thêm `Edit(./**)` và `Edit(//<worktree>/**)` nên không sửa được working tree chính lẫn worktree.
+     lượt trao đổi có thêm `Edit(./**)`, `Edit(//<repo>/**)` cho mọi repo trong config và `Edit(//<codeDir>/.hub-worktrees/**)`,
+     nên không sửa được working tree chính nào lẫn worktree (D26: `Edit(./**)` một mình chỉ che repo của task).
+   - Một task có repo chính (cwd) nhưng làm được ở mọi repo trong config (D26): lời dặn liệt kê các repo kèm đường dẫn,
+     ưu tiên repo chính, đọc CLAUDE.md của repo khác trước khi đụng tới nó, không tách task chỉ vì khác repo.
    - Khi `rcKeyDir` có `rc.py`, mọi lượt có `--append-system-prompt` nói cách đọc RC bằng nó (`RC_RULE`), kể cả phiên `--resume`.
    - Env của tiến trình con chỉ có PATH, HOME… (`childEnv`), không có `.env` của hub, và có `GIT_OPTIONAL_LOCKS=0`.
    - Đã kiểm với Claude thật (09/11, env giống runner): thấy tool Databuckets, nạp cả hai CLAUDE.md, ghi trong
@@ -169,12 +173,14 @@ Cột "Mặc định" là `DEFAULT_MODULES` trong `src/config.ts`; module nào c
 4. **Bạn bấm "Duyệt và làm".** Hub xếp một lượt `execute`. Runner chạy với cùng quyền như bước 2, trừ luật
    `Edit(./**)`, và được build, test khi cần (D15):
    - Mặc định trong working tree chính của repo, như phiên thường của bạn. Lời dặn: `git status` trước khi sửa,
-     không push, chỉ commit khi bạn bảo và chỉ stage file mình sửa.
+     không push, chỉ commit khi bạn bảo và chỉ stage file mình sửa. Sửa repo khác chỉ khi việc đã duyệt có nhắc tới
+     nó, và cũng `git status` ở repo đó trước (D26).
    - Task bật "Worktree riêng" (`isolated`): runner tạo worktree `<codeDir>/.hub-worktrees/<repo>-task<id>` (branch
      `hub/task-<id>`, từ HEAD) và chạy trong đó. Lời dặn: chỉ sửa trong worktree, không commit (diff so với HEAD là
-     thứ bạn xem), không push.
+     thứ bạn xem), không push. Mọi working tree chính (cả của repo đó) bị `Edit` deny: repo khác chỉ đọc.
 5. **Xong lượt làm.** Runner ghi diff stat vào luồng trao đổi: cả worktree, hoặc trong working tree chính chỉ các
-   file lượt đó sửa qua Edit/Write (runner gom từ stream). Task chuyển sang "Chờ bạn xem".
+   file lượt đó sửa qua Edit/Write (runner gom từ stream), theo từng repo khi lượt sửa cả repo khác. Task chuyển sang
+   "Chờ bạn xem".
 
 ## Đổi AI chạy Develop
 
@@ -182,16 +188,17 @@ Develop là phần duy nhất cần AI; collector, trang web, extension và thô
 trong Develop nằm ở một file adapter, `src/lib/claude.ts` (config `ai: "claude"`). Runner (`src/runner/runner.ts`) giữ
 phần chung: hàng đợi, giờ treo, ghi luồng chat, diff, thông báo, và chỉ thấy output của AI qua `NeutralEvent`.
 Đổi AI = viết một file adapter khác export cùng các tên, đăng ký nó trong `AIS` ở `src/modules/develop/prompts.ts`, cho
-config `ai` chọn nó, và qua đủ 6 probe bên dưới.
+config `ai` chọn nó, và qua đủ 8 probe bên dưới.
 
 **Adapter export:**
 
 | Tên | Việc |
 |---|---|
-| `features` | `{ images, effort, chrome, background, cost: boolean; models: Record<id, nhãn>; efforts: Record<id, nhãn> }`: AI có gì. Form Task chỉ hiện ô AI có |
+| `features` | `{ images, effort, chrome, background, cost, context, compact, commands: boolean; models: Record<id, nhãn>; efforts: Record<id, nhãn> }`: AI có gì. Trang chỉ hiện phần AI có (ô chọn, khối Context, nút Compact, gợi ý `/`) |
 | `binary()` | Đường dẫn CLI của AI |
 | `turnArgs(task, kind, rules)` | Tham số CLI cho lượt `discuss` hay `execute`, gồm quyền và luật deny; `rules` là lời dặn chung của hub cho mọi lượt (system prompt) |
-| `message(prompt, images)` | Một dòng stdin mang prompt, kèm ảnh |
+| `message(prompt, images)` | Một dòng stdin mang prompt, kèm ảnh (Claude: chữ đứng sau ảnh, vì CLI chỉ đọc lệnh ở khối cuối) |
+| `isCommand(text)` | Tin là một lệnh hay skill của AI (`/tên …`): gửi nguyên văn, không bọc. AI không có lệnh thì trả `false` |
 | `parse(line)` | Một dòng output → `NeutralEvent[]` (không, một hay nhiều sự kiện) |
 | `describeTool(name, input)` | Một dòng ngắn mô tả tool đang chạy, cho trang task |
 | `DEFAULT_LABEL` | `{ model, effort }` mặc định của tài khoản, để hiện trên form (`''` = không biết) |
@@ -207,11 +214,16 @@ config `ai` chọn nó, và qua đủ 6 probe bên dưới.
 | `{ kind: 'tool', name, input }` | AI gọi tool (`file`: file nó sửa, nếu là lệnh sửa file) | Tiến độ; gom file cho diff cuối lượt làm (D15) |
 | `{ kind: 'ack' }` | Một tin viết vào stdin đã được nhận | Đánh dấu tin `merged`; chỉ đóng stdin khi mọi tin đã được nhận (D18, D20) |
 | `{ kind: 'jobs', pending }` | Số việc nền còn chạy | `pending > 0`: lượt đang chờ việc nền, giữ stdin mở (D17) |
-| `{ kind: 'end', ok, cost, subtype?, text? }` | Một lượt bên trong phiên kết thúc; `cost` là tổng cộng dồn của phiên; `text` là câu trả lời của lượt nếu sự kiện mang nó | Thành một tin trong luồng; đóng stdin khi không còn việc nền và lượt đã có trả lời |
+| `{ kind: 'end', ok, cost, subtype?, text? }` | Một lượt bên trong phiên kết thúc; `cost` là tổng cộng dồn của phiên; `text` là câu trả lời của lượt nếu sự kiện mang nó | Thành một tin trong luồng; đóng stdin khi không còn việc nền và lượt đã có trả lời. Một lượt bên trong có `local` mà không có `ack` (lệnh AI tự trả lời, như `/context`): tính là một tin đã nhận (D25) |
+| `{ kind: 'context', used, model }` | Số token đang nằm trong context của phiên, theo model vừa trả lời (không tính subagent, không tính kết quả lệnh cục bộ) | Ghi `develop_tasks.context_used` (D25) |
+| `{ kind: 'window', model, tokens }` | Cỡ context của một model | Ghi `context_window` khi `model` trùng model của `context` |
+| `{ kind: 'compact', auto, before }` | Phiên vừa được tóm tắt (`auto`: AI tự làm khi gần đầy); `before`: số token lúc đó | Một dòng trong luồng; tính là lượt có nói. Compact bấm tay: bỏ qua chữ và số context tới hết lượt đó (có thể là tin cũ được hiện lại); compact tự động thì AI làm tiếp, số sau đó là số mới |
+| `{ kind: 'local' }` | AI tự trả lời một lệnh, không gọi model và không `ack` | Thay cho `ack` của lệnh đó ở cuối lượt bên trong |
+| `{ kind: 'commands', list }` | Các lệnh và skill dùng được: `{ name, description, hint }` | Ghi `develop_commands` theo repo, cho gợi ý `/` |
 
 **6 probe, phải qua đủ trước khi cho một AI chạy Develop.** Thiếu điều nào thì không dùng AI đó. Probe bằng CLI thật,
 model rẻ, file giả, rồi ghi kết quả vào [decisions.md](decisions.md) như D14, D15 đã làm:
-1. Lượt trao đổi không sửa được file: working tree chính, và worktree của task.
+1. Lượt trao đổi không sửa được file: working tree chính của mọi repo trong config, và worktree.
 2. Không `git push`, không lệnh git phá việc của người khác: `stash`, `reset --hard`, `clean`, `checkout .`,
    `restore .`, `add -A`, `add .`.
 3. Không đọc được file bí mật (`~/.claude.json`, `.env`, key RC, `~/.ssh`…) và `data/` của hub.
@@ -219,6 +231,10 @@ model rẻ, file giả, rồi ghi kết quả vào [decisions.md](decisions.md) 
 5. Lượt sau tiếp đúng phiên của lượt trước.
 6. Nhận tin qua stdin trong lúc đang chạy. Không được thì ô trả lời chỉ nên mở khi lượt đã xong: chưa làm, vì
    `features.background` và `features.cost` chưa được trang đọc (mới chỉ có Claude Code).
+7. Context: số token trong context sau mỗi câu trả lời và cỡ context của model, khớp với số AI tự báo (Claude: `/context`).
+   Không có thì `features.context = false`.
+8. Lệnh: một tin bắt đầu bằng lệnh chạy lệnh đó, kể cả compact, và lượt kết thúc chứ không treo. Không có thì
+   `features.commands = false` và `features.compact = false`.
 
 **Còn gắn với Claude Code ngoài adapter:**
 - Module `agents` đọc transcript của Claude Code (`~/.claude/projects/`). Dùng AI khác thì tắt module này, hoặc viết module
@@ -306,9 +322,9 @@ model rẻ, file giả, rồi ghi kết quả vào [decisions.md](decisions.md) 
 
 ## Databuckets
 
-- Chỉ đi qua MCP `chat_with_agent`, với token tĩnh: `DATABUCKETS_URL` và `DATABUCKETS_TOKEN` trong `.env`, không có thì
+- Chỉ đi qua MCP (`ask_db_agent`, chờ kết quả bằng `get_agent_progress`; `chat_with_agent` bị bỏ từ 16/11), với token tĩnh: `DATABUCKETS_URL` và `DATABUCKETS_TOKEN` trong `.env`, không có thì
   MCP `databuckets` trong `~/.claude.json`. Giới hạn và chỗ dễ sai: [sources.md](sources.md).
-- Một lần gọi mất khoảng 100 giây. Nhiều câu EQL nhỏ có thể chung một lần gọi.
+- Một lần gọi mất 1–4 phút (16/11; khoảng 100 giây với tool cũ). Nhiều câu EQL nhỏ có thể chung một lần gọi.
 - Agent của Databuckets không chạy EQL thô: nó dịch câu sang "QueryModel" của họ. Đừng dặn nó "không
   chạy nguyên văn được thì từ chối", vì nó sẽ từ chối hết (đã xảy ra 08/11).
 - Hub so câu EQL thật sự chạy (nằm trong khối "Query results") với câu của mình. Agent chỉ được đổi
@@ -316,7 +332,7 @@ model rẻ, file giả, rồi ghi kết quả vào [decisions.md](decisions.md) 
   vài lần với khoảng 36 ngày), thì cả kết quả bị bỏ.
 - Mỗi kết quả tối đa 1.000 dòng.
 - Ngày tính theo UTC. Bucket đầu (thiếu) và bucket hôm nay (đang chạy) luôn bị bỏ.
-- Report: 4 lần gọi mỗi ngày, và 4 lần ngay ở lần chạy đầu khi có app. Theo dõi: 1 lần gọi D0 mỗi ngày (cũng ngay ở lần chạy đầu), 1 lần gọi (tối đa 7 EQL) cho mỗi đợt đang chạy mỗi 6 giờ, và truy vấn theo giờ của đề xuất trong vài ngày đầu. Không bao giờ tự gọi lại.
+- Report: 4 lần gọi mỗi ngày, và 4 lần ngay ở lần chạy đầu khi có app. Theo dõi: 1 lần gọi D0 mỗi ngày (cũng ngay ở lần chạy đầu), 1 lần gọi (tối đa 7 EQL) cho mỗi đợt đang chạy mỗi 6 giờ, và truy vấn theo giờ của đề xuất trong vài ngày đầu. Segment (`segsync`, khi bật): 1 lần gọi mỗi ngày. Không bao giờ tự gọi lại.
 
 ## Lệnh
 

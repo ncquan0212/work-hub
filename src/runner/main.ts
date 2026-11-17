@@ -4,8 +4,7 @@
 // Restarting the hub never kills a turn.
 //   node src/runner/main.ts            run forever
 //   node src/runner/main.ts once       start what is queued, wait for it, exit (manual check)
-import { join } from 'node:path'
-import { CODE, ENABLED, REPOS } from '../config.ts'
+import { ENABLED, REPOS, WORKTREES } from '../config.ts'
 import { openDb } from '../core/db.ts'
 import { log } from '../core/log.ts'
 import { ai } from '../modules/develop/prompts.ts'
@@ -24,7 +23,7 @@ process.on('exit', () => { try { releaseRunner(db) } catch { /* db closed */ } }
 for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, () => process.exit(0))
 setInterval(() => { try { beatRunner(db) } catch (e) { log('warn', 'runner beat failed', { err: (e as Error).message }) } }, BEAT_MS).unref()
 
-const runner = new Runner({ db, repos: REPOS, bin, worktrees: join(CODE, '.hub-worktrees') })
+const runner = new Runner({ db, repos: REPOS, bin, worktrees: WORKTREES })
 
 if (process.argv[2] === 'once') {
   await Promise.all(runner.tick())

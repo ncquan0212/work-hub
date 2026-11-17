@@ -10,10 +10,16 @@ import { promisify } from 'node:util'
 import { cut } from '../core/html.ts'
 import { log } from '../core/log.ts'
 import { notify, type Note } from '../lib/notify.ts'
-import { ai, executeNote, executePrompt, SYSTEM_RULES, TURN_MAX_MS, TURN_TIMEOUT_MS } from '../modules/develop/prompts.ts'
-import { addMessage, getFile, getTask, noteModel, setStatus, type Task, type Turn } from '../modules/develop/store.ts'
+import { ai, executeNote, executePrompt, SYSTEM_RULES, taskPreamble, TURN_MAX_MS, TURN_TIMEOUT_MS, turnRules } from '../modules/develop/prompts.ts'
+import { addMessage, getFile, getTask, kTokens, noteCompact, noteModel, saveCommands, saveContext, saveWindow, setStatus, type Task, type Turn } from '../modules/develop/store.ts'
 
 const run = promisify(execFile)
+/** The paths under `dir` (as given, or through its real path: /tmp is /private/tmp on macOS). */
+function inside(dir: string, paths: string[]) {
+  let real = dir; try { real = realpathSync(dir) } catch { /* gone: nothing is under it */ }
+  const roots = [dir, real].map(r => r + sep)
+  return paths.filter(p => roots.some(r => p.startsWith(r)))
+}
 type Repo = { key: string; name: string; repo: string }
 /** bin: the AI's CLI (ai.binary(), or a fake one in the tests). */
 export type RunnerOptions = { db: DatabaseSync; repos: Repo[]; bin: string; worktrees: string; turnTimeoutMs?: number; turnMaxMs?: number }
@@ -100,10 +106,20 @@ export class Runner {
     return getTask(this.o.db, t.id)!
   }
 
+  /** What an execution turn changed in the main trees, only the files it wrote (Edit/Write): its own repo, then each
+   *  other repo it wrote in (a task may work across repos, owner 2026-11-16, plan §13). */
+  async changes(own: string, cwd: string, edited: string[]) {
+    const head = 'Thay đổi so với HEAD, chỉ các file lượt này sửa trong working tree chính'
+    const others = this.o.repos.filter(r => r.key !== own && inside(r.repo, edited).length)
+    if (!others.length) return `${head}:\n${await this.diffSummary(cwd, edited)}`
+    const parts = await Promise.all([{ name: this.o.repos.find(r => r.key === own)?.name ?? own, repo: cwd }, ...others]
+      .map(async r => `${r.name}:\n${await this.diffSummary(r.repo, edited)}`))
+    return `${head}, theo repo:\n\n${parts.join('\n\n')}`
+  }
+
   /** Changes against HEAD in `dir`, all of them or only `paths` (absolute; any outside `dir` are dropped, git refuses them). */
   async diffSummary(dir: string, paths?: string[]) {
-    let real = dir; try { real = realpathSync(dir) } catch { /* gone: git says so below */ }
-    const roots = [dir, real].map(r => r + sep), spec = paths?.filter(p => roots.some(r => p.startsWith(r)))
+    const spec = paths && inside(dir, paths)
     if (spec && !spec.length) return 'Không có file nào trong repo được sửa bằng Edit/Write (sửa bằng lệnh Bash thì không liệt kê được).'
     const tail = spec ? ['--', ...spec] : []
     try {
@@ -120,7 +136,8 @@ export class Runner {
   async start(turn: Turn): Promise<void> {
     const { db } = this.o
     let task = getTask(db, turn.task_id)!
-    let cwd = this.o.repos.find(r => r.key === task.repo)?.repo
+    const repo = this.o.repos.find(r => r.key === task.repo)
+    let cwd = repo?.repo
     try {
       if (!cwd) throw new Error(`repo ${task.repo} không có trong danh sách`)
       // the main working tree is the default (owner 2026-11-09); a worktree only when the task asks for one
@@ -139,7 +156,9 @@ export class Runner {
     }
     // discussion prompts are complete at queue time; an execution turn carries the owner's note and gets
     // its instructions here, now that the worktree path is known
-    const args = ai.turnArgs(task, turn.kind, SYSTEM_RULES)
+    // the turn's own rules (task, discussion or execution) go in the system prompt with the general ones, so a message that
+    // is a command, sent as it is, still has them (plan §12)
+    const args = ai.turnArgs(task, turn.kind, [...turnRules(task, turn.kind, this.o.repos), ...SYSTEM_RULES])
     const child = spawn(this.o.bin, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env: childEnv() })
     child.stdin!.on('error', () => { /* claude exited before we closed stdin */ })
     const act = db.prepare('insert into develop_activity (task_id, turn_id, at, text) values (?, ?, ?, ?)')
@@ -153,7 +172,13 @@ export class Runner {
     const merged: number[] = [] // replies written into this session, in order (stdin message i + 1)
     const write = (prompt: string, files: string | null) => { child.stdin!.write(ai.message(prompt, images(files))); sent++ }
     const setWaiting = (w: number) => { if (w !== waiting) db.prepare('update develop_turns set waiting = ? where id = ?').run(waiting = w, turn.id) }
-    write(turn.kind === 'execute' ? executePrompt(task, turn.prompt) : turn.prompt, turn.files)
+    const first = turn.kind === 'execute' ? executePrompt(task, turn.prompt) : turn.prompt
+    // a command must open its message (prompts.ts): a session that has not seen the task yet gets it first, in this same
+    // session (Claude only says it read it), then the command
+    // (the title too when there is no description: it is not in the system prompt, it may be a Jira summary)
+    if (!task.session_started && ai.isCommand(first) && task.body.trim() !== first.trim()) write(taskPreamble(task), null)
+    write(first, turn.files)
+    const lead = sent // stdin messages before the first merged reply
     // a reply the owner sends while Claude waits on its background job (the page allows it then) goes into this
     // session, so the job keeps running; before 2026-11-09 the only way to say something was "Dừng", which killed it
     const absorb = () => {
@@ -175,8 +200,12 @@ export class Runner {
     db.prepare(`update develop_turns set pid = ? where id = ?`).run(child.pid ?? null, turn.id)
     log('info', 'turn started', { task: task.id, turn: turn.id, kind: turn.kind, pid: child.pid })
 
-    let lastText = '', result = null as { ok: boolean; subtype?: string } | null, stderr = '', pending = 0, replies = 0, cost = 0, spoke = false
+    let lastText = '', result = null as { ok: boolean; subtype?: string; text?: string } | null, stderr = '', pending = 0, replies = 0, cost = 0, spoke = false
     let said = '', jobs = false, jobDoneAt = -1 // Claude's latest reply; a background job ran; `replies` when one finished
+    // acked: a message was taken in this inner turn; local: a command was answered locally in it. compacted: /compact ran
+    // in it, and what comes after in the same turn may be old messages claude shows again: their text and figures are not
+    // taken (an automatic compact goes on working, so its later figures are new)
+    let acked = false, local = false, compacted = false, ctxModel = ''
     const edited = new Set<string>() // files this turn wrote through the tools: in the shared main tree, git diff alone shows other sessions' work too
     // killed only when hung: no output for turnTimeoutMs (a running workflow prints progress), or past turnMaxMs
     const idle = this.o.turnTimeoutMs ?? TURN_TIMEOUT_MS, max = this.o.turnMaxMs ?? TURN_MAX_MS
@@ -192,14 +221,23 @@ export class Runner {
           noteModel(db, task.model ?? 'default', e.model)
         }
         else if (e.kind === 'session') { if (!task.session_started) { db.prepare('update develop_tasks set session_started = 1 where id = ?').run(task.id); task.session_started = 1 } }
-        else if (e.kind === 'ack') echoed++
+        else if (e.kind === 'ack') { echoed++; acked = true }
+        else if (e.kind === 'context') { if (!compacted) { ctxModel = e.model; saveContext(db, task.id, e.used, e.model) } }
+        else if (e.kind === 'local') { if (!compacted) local = true }
+        else if (e.kind === 'window') { if (e.model === ctxModel) saveWindow(db, task.id, e.tokens) }
+        else if (e.kind === 'commands') saveCommands(db, task.repo, e.list)
+        else if (e.kind === 'compact') {
+          compacted = !e.auto; spoke = true; noteCompact(db, task.id)
+          addMessage(db, task.id, 'system', `${e.auto ? 'Claude tự compact vì context gần đầy' : 'Đã compact'}${e.before ? `: trước đó context có ${kTokens(e.before)} token` : ''}. Số mới hiện khi Claude trả lời tiếp.`)
+          act.run(task.id, turn.id, Date.now(), 'Compact xong')
+        }
         else if (e.kind === 'text' || e.kind === 'tool') {
           spoke = true; setWaiting(0)
           if (e.kind === 'tool') {
             act.run(task.id, turn.id, Date.now(), ai.describeTool(e.name, e.input))
             if (e.file) edited.add(resolve(cwd!, e.file))
           }
-          else if (e.text.trim()) lastText = e.text
+          else if (e.text.trim() && !compacted) lastText = e.text
         }
         else if (e.kind === 'jobs') { pending = e.pending; if (pending) jobs = true }
         else if (e.kind === 'end') {
@@ -208,7 +246,12 @@ export class Runner {
           // session's running total (lib/claude.ts)
           result = e; cost = Number(e.cost ?? 0) || cost
           if (!e.ok && !dying) dying = 'error' // it may exit now: a reply written after this could be lost
-          const text = String(e.text ?? lastText).trim(); lastText = ''
+          // a command claude answers itself (/context) is never echoed: its local answer stands for the ack, or the turn
+          // would wait for one until the idle timeout (probe 2026-11-16). Not any turn that spoke: a background job's
+          // report takes no message, and claude holds a command until the turn it is in ends (review 2026-11-16)
+          if (!acked && local && echoed < sent) echoed++
+          acked = false; local = false
+          const text = String(e.text ?? (compacted ? '' : lastText)).trim(); lastText = ''; compacted = false
           if (text) { addMessage(db, task.id, 'claude', text); replies++; said = text }
           // the job's own report is in: tell the owner now (a workflow can run 45 minutes), not only when the session closes
           if (jobs && !pending && e.ok) { jobs = false; jobDoneAt = replies; note(db, task, `turn:${turn.id}:job:${replies}`, 'Việc chạy nền xong', said || 'Xem kết quả trong task.') }
@@ -228,14 +271,16 @@ export class Runner {
     clearTimeout(quiet); clearTimeout(cap); this.running.delete(turn.id); this.absorbers.delete(turn.id)
     setWaiting(0)
     // replies written but never taken (the process ended first) go back to the queue and run on their own
-    const unread = merged.slice(Math.max(0, echoed - 1))
+    const unread = merged.slice(Math.max(0, echoed - lead))
     for (const q of unread) db.prepare(`update develop_turns set status = 'queued', started_at = null, ended_at = null where id = ? and status = 'merged'`).run(q)
 
     const cancelled = (db.prepare('select status from develop_turns where id = ?').get(turn.id) as { status: string }).status === 'cancel'
     const ok = !cancelled && code === 0 && !!result?.ok
     const reply = replies ? '' : lastText.trim() // a crash before any result: keep the last thing Claude said
     const killed = dying && dying !== 'error' ? dying : '' // the hub stopped it (hung): say so, not the last result's subtype
-    const why = cancelled ? 'owner huỷ' : killed ? `hub dừng: ${killed}` : `${result?.subtype ?? `exit ${code}`}${stderr ? `: ${stderr.slice(-300)}` : ''}`
+    // a failed result's own text says why: the weekly limit comes as subtype "success" + is_error (turn 221, 2026-11-12)
+    const what = (result && !result.ok && result.text?.trim().slice(0, 200)) || result?.subtype || `exit ${code}`
+    const why = cancelled ? 'owner huỷ' : killed ? `hub dừng: ${killed}` : `${what}${stderr ? `: ${stderr.slice(-300)}` : ''}`
     db.prepare(`update develop_turns set status = ?, ended_at = ?, cost_usd = ?, error = ? where id = ?`)
       .run(cancelled ? 'cancelled' : ok ? 'done' : 'failed', Date.now(), cost, ok ? null : why, turn.id)
     // the turn row keeps the session total after it; the task's cost IS that total (adding them counted turns twice)
@@ -243,14 +288,14 @@ export class Runner {
     if (reply) { addMessage(db, task.id, 'claude', reply); said = reply }
     if (cancelled) addMessage(db, task.id, 'system', 'Đã dừng lượt chạy theo yêu cầu.')
     else if (killed) addMessage(db, task.id, 'system', `Hub dừng lượt này: ${killed}.`)
-    else if (!ok) addMessage(db, task.id, 'system', `Lượt chạy lỗi (${result?.subtype ?? `exit ${code}`}).`)
+    else if (!ok) addMessage(db, task.id, 'system', `Lượt chạy lỗi (${what}).`)
     if (turn.kind === 'execute') addMessage(db, task.id, 'system', task.isolated
       ? `Thay đổi trong worktree:\n${await this.diffSummary(cwd!)}`
-      : `Thay đổi so với HEAD, chỉ các file lượt này sửa trong working tree chính:\n${await this.diffSummary(cwd!, [...edited])}`)
+      : await this.changes(task.repo, cwd!, [...edited]))
     setStatus(db, task.id, ok && turn.kind === 'execute' ? 'review' : 'awaiting')
     // the task now waits for the owner. Stopped by the owner: nothing to say. Ended right on the job report: already said
     const end = `turn:${turn.id}:end`
-    if (!cancelled && !ok) note(db, task, end, killed ? 'Hub dừng lượt' : 'Lượt lỗi', killed ? `Hub dừng lượt này: ${killed}.` : `Lượt chạy lỗi (${result?.subtype ?? `exit ${code}`}).`, 'warn')
+    if (!cancelled && !ok) note(db, task, end, killed ? 'Hub dừng lượt' : 'Lượt lỗi', killed ? `Hub dừng lượt này: ${killed}.` : `Lượt chạy lỗi (${what}).`, 'warn')
     else if (ok && turn.kind === 'execute') note(db, task, end, 'Làm xong, cần xem thay đổi', said || 'Xem thay đổi trong task.')
     else if (ok && jobDoneAt !== replies) note(db, task, end, 'Claude trả lời', said || 'Xem trong task.')
     log('info', 'turn ended', { task: task.id, turn: turn.id, ok, code, cost })

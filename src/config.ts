@@ -33,6 +33,9 @@ export type Browser = { id: string; name: string }
 /** Chrome profiles the bridge extension runs in, by role: `falcon` = signed in to Chrome with the company account
  *  (Play Console, Jira), `publisher` = the publisher mailbox (Gmail feedback, AdMob). The value is the label shown. */
 export type ProfileRole = 'falcon' | 'publisher'
+/** segsync (D27): campaigns of one ad network found in Databuckets are appended to one segment of the app's
+ *  `user_segments` RC parameter. autoPublish false = the module only proposes the rc.py command. */
+export type SegmentSync = { app: string; segment: string; mediaSource: string; autoPublish?: boolean }
 
 type File = {
   modules?: string[]
@@ -49,6 +52,7 @@ type File = {
   chromeDomains?: Record<string, ProfileRole>
   companyDomains?: string[]
   ai?: string
+  segmentSync?: SegmentSync
 }
 
 /** Modules on when the file names none: the ones that need no account, plus those that follow the apps in the file
@@ -75,6 +79,8 @@ function load(): File {
     if (role !== 'falcon' && role !== 'publisher') throw new Error(`${CONFIG_FILE}: chromeDomains["${d}"] phải là "falcon" hoặc "publisher"`)
   for (const [n, ips] of Object.entries(f.access?.devices ?? {}))
     if (!Array.isArray(ips) || !ips.every(x => typeof x === 'string')) throw new Error(`${CONFIG_FILE}: access.devices["${n}"] phải là mảng IP`)
+  const ss = f.segmentSync
+  if (ss && ![ss.app, ss.segment, ss.mediaSource].every(x => typeof x === 'string' && x)) throw new Error(`${CONFIG_FILE}: segmentSync cần app, segment và mediaSource`)
   for (const r of f.repos ?? []) {
     if (!r?.key || !r.name || !r.repo) throw new Error(`${CONFIG_FILE}: mỗi repo cần key, name và repo`)
     if (keys.has(r.key)) throw new Error(`${CONFIG_FILE}: key repo trùng: ${r.key}`)
@@ -92,6 +98,8 @@ export function expand(p: string, base: string) {
 }
 
 export const CODE = expand(file.codeDir ?? '~/Code', HOME)
+/** Where the runner puts a Develop task's own worktree (the task's "Worktree riêng"). */
+export const WORKTREES = join(CODE, '.hub-worktrees')
 /** Where the Remote Config service-account keys (and the owner's rc.py) live, read in place. */
 export const RC_DIR = expand(file.rcKeyDir ?? join(CODE, 'tv-rc'), CODE)
 export const rcKeyPath = (a: App) => a.rcKey ? expand(a.rcKey, RC_DIR) : null
@@ -132,6 +140,9 @@ export const JIRA_HOST = (file.jiraHost ?? '').replace(/\/+$/, '')
 export const CHROME_DOMAINS: Record<string, ProfileRole> = file.chromeDomains ?? {}
 /** Mail from these domains is the company's own, not user feedback (Gmail panel). Default: the chromeDomains. */
 export const COMPANY_DOMAINS = file.companyDomains ?? Object.keys(CHROME_DOMAINS)
+
+/** segsync's job, or null: the module says "chưa cấu hình". */
+export const SEGMENT_SYNC: SegmentSync | null = file.segmentSync ?? null
 
 /** The AI that runs Develop tasks (src/lib/claude.ts is the only one so far; architecture.md "Đổi AI"). */
 export const AI = file.ai ?? 'claude'

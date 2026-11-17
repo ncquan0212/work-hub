@@ -94,7 +94,8 @@ export async function getJson(url: string, tok: string, signal?: AbortSignal) {
     if (r.status === 503 && attempt === 0) { await new Promise(res => setTimeout(res, 2000)); continue }
     // per-minute read quota (Crashlytics 2026-11-08 during the 35-day backfill): wait out the minute once
     if (r.status === 429 && attempt === 0) { await new Promise(res => setTimeout(res, 61_000)); continue }
-    if (!r.ok) throw new Error(`${r.status} ${j.error?.status ?? ''} ${String(j.error?.message ?? '').slice(0, 120)}`.trim())
+    // 300: a quota error names whose quota ran out ("…for consumer 'project_number:…'") past the first 120
+    if (!r.ok) throw new Error(`${r.status} ${j.error?.status ?? ''} ${String(j.error?.message ?? '').slice(0, 300)}`.trim())
     return j
   }
 }

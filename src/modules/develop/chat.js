@@ -7,7 +7,9 @@
 //  - the thread updates itself from /develop/task/:id/live: new messages, "Claude đang…", the panels, what the box
 //    offers (2 s while a turn is open, 15 s otherwise, slower in a background tab);
 //  - the view follows new messages when it is at the bottom, otherwise a button says there are new ones;
-//  - a copy button on Claude's replies.
+//  - a copy button on Claude's replies;
+//  - "/" at the start of the box lists the commands and skills claude offers in the task's repo (plan §12): filtered as
+//    the name is typed; arrows and Enter or Tab pick on a keyboard, a tap picks on a phone, Escape closes.
 // Everything put into the page is HTML the hub rendered and escaped (develop/index.ts), or text set as text.
 {
   const msgs = document.querySelector('.develop-msgs[data-task]')
@@ -129,8 +131,67 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) poll() })
     timer = setTimeout(poll, state === 'reply' ? 15_000 : 2_000)
 
+    // the "/" suggestions: fetched once (again after a failure), only while the box holds "/name" and nothing else
+    const list = document.getElementById('compose-cmds'), count = document.getElementById('compose-cmds-n')
+    let cmds = null, shown = [], active = -1
+    // an empty list is asked again next time: the runner saves it when a turn starts, maybe after this page opened
+    const load = () => fetch(`${base}/commands`, { cache: 'no-store' }).then(r => r.ok ? r.json() : Promise.reject())
+      .then(a => { if (!a.length) cmds = null; return a }).catch(() => { cmds = null; return [] })
+    const typed = () => /^\/([\w:.-]*)$/.exec(ta.value)
+    // a textarea cannot say it opened a list (aria-expanded is not exposed on a textbox): a polite line says it instead
+    const announce = text => { if (count && count.textContent !== text) count.textContent = text }
+    const close = () => {
+      if (!list || list.hidden) return
+      list.hidden = true; shown = []; active = -1; announce('')
+      ta.setAttribute('aria-expanded', 'false'); ta.removeAttribute('aria-activedescendant')
+    }
+    const mark = i => {
+      active = i
+      list.querySelectorAll('[role=option]').forEach((li, j) => li.setAttribute('aria-selected', String(j === i)))
+      if (i < 0) return ta.removeAttribute('aria-activedescendant')
+      ta.setAttribute('aria-activedescendant', `cmd-${i}`); list.children[i]?.scrollIntoView({ block: 'nearest' })
+    }
+    const pick = c => {
+      ta.value = `/${c.name} `; close()
+      ta.focus({ preventScroll: true }); ta.setSelectionRange(ta.value.length, ta.value.length)
+      ta.dispatchEvent(new Event('input')) // the draft keeps it
+    }
+    const el = (tag, cls, text) => Object.assign(document.createElement(tag), cls ? { className: cls } : {}, text != null ? { textContent: text } : {})
+    const suggest = async () => {
+      if (!list || !typed()) return close()
+      const all = await (cmds ??= load())
+      const m = typed() // the box may have changed while the list came
+      if (!m) return close()
+      const q = m[1].toLowerCase(), name = c => c.name.toLowerCase()
+      shown = [...all.filter(c => name(c).startsWith(q)), ...all.filter(c => !name(c).startsWith(q) && name(c).includes(q))].slice(0, 8)
+      if (!shown.length) return close()
+      list.replaceChildren(...shown.map((c, i) => {
+        const li = Object.assign(el('li'), { id: `cmd-${i}` }), head = el('span', 'develop-cmd-name')
+        li.setAttribute('role', 'option'); li.setAttribute('aria-selected', 'false')
+        head.append(el('b', '', `/${c.name}`)); if (c.hint) head.append(el('span', 'develop-cmd-hint', c.hint))
+        li.append(head); if (c.description) li.append(el('span', 'develop-cmd-desc', c.description))
+        li.addEventListener('click', () => pick(c))
+        return li
+      }))
+      list.hidden = false; ta.setAttribute('aria-expanded', 'true')
+      announce(`${shown.length} lệnh. Mũi tên hoặc chạm để chọn.`)
+      mark(keyboard.matches ? 0 : -1) // a phone has no arrows: nothing is chosen until tapped, Enter stays a new line
+    }
+    // the box keeps the focus whatever is pressed in the list: a row, its padding, its scrollbar (review 2026-11-16)
+    list?.addEventListener('mousedown', e => e.preventDefault())
+    ta.addEventListener('input', suggest)
+    ta.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== ta) close() }, 200))
+
     const say = text => { err.textContent = text }
     ta.addEventListener('keydown', e => {
+      // the same IME guard as sending (Safari ends a Telex word with an Enter of keyCode 229); Cmd/Ctrl+Enter still sends
+      if (list && !list.hidden && shown.length && !e.isComposing && e.keyCode !== 229) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault(); return mark(e.key === 'ArrowDown' ? (active + 1) % shown.length : active > 0 ? active - 1 : shown.length - 1)
+        }
+        if ((e.key === 'Enter' || e.key === 'Tab') && active >= 0 && !e.shiftKey && !e.metaKey && !e.ctrlKey) { e.preventDefault(); return pick(shown[active]) }
+        if (e.key === 'Escape') { e.preventDefault(); return close() }
+      }
       if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229 || e.shiftKey || e.altKey) return
       if (!(e.metaKey || e.ctrlKey || keyboard.matches)) return
       e.preventDefault()
@@ -142,7 +203,7 @@
       const body = new FormData(form, e.submitter)
       // what goes now: text typed or images pasted while it is on its way stay in the box
       const text = ta.value, nFiles = form.querySelector('input[type=file]')?.files.length ?? 0
-      busy = true; say(''); form.classList.add('is-sending')
+      busy = true; say(''); close(); form.classList.add('is-sending')
       const buttons = [...form.querySelectorAll('button[type=submit]')]; buttons.forEach(b => { b.disabled = true })
       try {
         const r = await fetch(`${form.action}?js=1`, { method: 'POST', body })

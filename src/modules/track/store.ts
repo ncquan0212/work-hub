@@ -10,7 +10,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { APPS, PROFILE_LABELS, rcKeyPath } from '../../config.ts'
 import { dailyMissed } from '../../core/scheduler.ts'
 import { NotConfigured } from '../../core/types.ts'
-import { eqlDiff, mcpSession, normEql, parseQueryResults, runEql, toRows, type Row } from '../../lib/databuckets.ts'
+import { askAgent, eqlDiff, mcpSession, normEql, parseQueryResults, runEql, toRows, type Row } from '../../lib/databuckets.ts'
 import { utcDay } from '../../lib/days.ts'
 import { firebaseUserToken, getJson, serviceAccountProject, serviceAccountToken } from '../../lib/google.ts'
 import { notify } from '../../lib/notify.ts'
@@ -241,7 +241,8 @@ export function suggest(db: DatabaseSync, now: number, rcComplete: Set<string>) 
 /** runEql, except that each query carries `ran`: the EQL the engine reports back, whose absolute `to` is one day after
  *  the one sent (probed 2026-11-09). ponytail: a copy of runEql's prompt and checks; give runEql a `ran` option and drop this. */
 export async function askAll(qs: Pick<RunQuery, 'eql' | 'ran' | 'cols'>[], signal: AbortSignal) {
-  const s = await mcpSession(AbortSignal.any([signal, AbortSignal.timeout(CALL_MS)]))
+  const sig = AbortSignal.any([signal, AbortSignal.timeout(CALL_MS)])
+  const s = await mcpSession(sig)
   const question = [
     'READ-ONLY: do not create, save, schedule, send or modify any report, dashboard, insight, alert or email.',
     `Execute each of the ${qs.length} EQL queries below exactly as written, once each, in order. No exploration, no follow-up queries, no chart, no rewriting.`,
@@ -251,10 +252,7 @@ export async function askAll(qs: Pick<RunQuery, 'eql' | 'ran' | 'cols'>[], signa
     'Reply with the Query results block only.',
     ...qs.flatMap((q, i) => [`Query ${i + 1}:`, '```', q.eql, '```']),
   ].join('\n')
-  const res = await s.call('chat_with_agent', { user_question: question })
-  const text = res?.content?.find((c: any) => c?.type === 'text')?.text
-  if (!text) throw new Error('Databuckets: trả lời rỗng')
-  const out = JSON.parse(text)
+  const out = await askAgent(s, question, sig)
   if (out.agent_run_failed) throw new Error(`Databuckets: agent lỗi: ${String(out.reply ?? '').slice(0, 160)}`)
   const results = parseQueryResults(String(out.reply ?? ''))
   return qs.map((q, i) => {

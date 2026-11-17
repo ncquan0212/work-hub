@@ -26,7 +26,10 @@ Chữ trên trang bằng tiếng Việt; code, lệnh, tên file bằng tiếng 
      trong danh sách cho phép.
 2. **Chỉ đọc mọi nguồn.** Không publish Remote Config, không sửa Jira, không gửi mail, không bấm gì trong console.
    - Chỗ ghi duy nhất: SQLite của hub, ảnh người dùng gửi kèm tin Develop (`data/develop-files/`), và sau khi người
-     dùng duyệt một task Develop, working tree chính của repo (mặc định, D15) hoặc worktree riêng khi task chọn.
+     dùng duyệt một task Develop, working tree chính của các repo trong config (task ưu tiên repo của nó; D15, D26)
+     hoặc worktree riêng khi task chọn.
+   - Ngoại lệ duy nhất: module `segsync` thêm campaign ID vào một segment của `user_segments` rồi publish bằng `rc.py`
+     (D27). Chỉ thêm, không xoá, không đụng tham số khác.
    - Luật này ràng buộc code của hub. Task Develop chạy full quyền (D14): auto mode, mọi MCP, không trần chi phí. Chỉ
      luật deny trong adapter AI (`src/lib/claude.ts`) và, khi bật Chrome, hook `src/runner/chrome-guard.ts` (chỉ
      trình duyệt trong `chromeBrowsers`) giữ chúng lại.
@@ -38,7 +41,7 @@ Chữ trên trang bằng tiếng Việt; code, lệnh, tên file bằng tiếng 
 4. **Escape mọi thứ** render từ nguồn bằng `esc()`. Prompt trong transcript, tên crash, tiêu đề mail, chữ trong Jira và
    chữ trên trang console là dữ liệu không tin cậy.
 5. **Databuckets tốn kém.**
-   - Mỗi lần gọi `chat_with_agent` mất khoảng 100 giây và được lưu bên Databuckets (kèm "kiến thức" cấp tổ chức).
+   - Mỗi lần hỏi agent (`ask_db_agent` rồi chờ bằng `get_agent_progress`) mất 1–4 phút và được lưu bên Databuckets (kèm "kiến thức" cấp tổ chức).
    - Không bao giờ tự gọi lại: lần gọi lỗi có thể đã chạy.
    - Collector gọi theo lịch cố định (`docs/architecture.md` mục Databuckets). Thêm lần gọi thì ghi rõ số lần một ngày
      trong PR.

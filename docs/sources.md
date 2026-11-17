@@ -27,7 +27,9 @@ Không làm được:
 
 ## Databuckets
 
-Đi qua MCP `chat_with_agent`: một agent LLM chạy câu EQL hub đưa. Đã đo khi xây hub:
+Đi qua MCP: một agent LLM chạy câu EQL hub đưa. Từ 16/11 server bỏ tool `chat_with_agent`; hub gọi `ask_db_agent` (trả
+`run_id` ngay) rồi hỏi `get_agent_progress` theo nhịp server báo, tới khi lượt chạy xong (`askAgent` trong
+`src/lib/databuckets.ts`). Mỗi lượt như vậy mất 1–4 phút (đo 16/11). Đã đo khi xây hub, với tool cũ:
 - **Mỗi lần gọi khoảng 100 giây** (58–175 giây). Bản thân query chỉ 1–44 giây, phần còn lại là LLM trung gian. Một lần
   gọi có thể chứa nhiều EQL (7 EQL mất khoảng 276 giây).
 - **Mỗi lần gọi được lưu thành một cuộc chat**, và trả về "kiến thức dataset" cấp tổ chức, có điều sai. Dùng hằng ngày

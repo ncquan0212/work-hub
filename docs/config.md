@@ -28,6 +28,7 @@ module bật theo mặc định ở bảng cuối. Biến `HUB_CONFIG` đổi đ
 | `chromeDomains` | Domain của tài khoản đăng nhập Chrome → vai trò: `{ "cong-ty.com": "falcon", "publisher.com": "publisher" }`. Ghi vào extension lúc build | `{}` (extension không nhận vai trò nào) | Phần sau `@` của email đăng nhập Chrome ở mỗi profile |
 | `companyDomains` | Domain của chính công ty: mail từ đó không tính là phản hồi của người dùng (Gmail) | Các domain trong `chromeDomains` | Thêm domain của đối tác gửi mail vào hộp publisher |
 | `ai` | AI chạy task Develop | `"claude"` | Hiện chỉ có `claude` (`docs/architecture.md` mục "Đổi AI") |
+| `segmentSync` | Việc của module `segsync` (D27): `{ "app": "brain", "segment": "google_user", "mediaSource": "googleadwords_int", "autoPublish": true }`. Campaign mới của network `mediaSource` được thêm vào segment `segment` trong tham số `user_segments` của app `app`, rồi publish. `autoPublish: false` = chỉ báo lệnh, không publish | Không có (module báo "chưa cấu hình") | Người dùng. `mediaSource` là giá trị `ua_media_source` trong Databuckets |
 
 ### Mỗi app trong `apps`
 
@@ -71,6 +72,7 @@ Extension tự nhận vai trò theo domain của tài khoản đang đăng nhậ
 | `repos` | Vận hành | Trạng thái git các repo, số version | git, `repo` của app và `repos` | Bật |
 | `crash` | Vận hành | Crashlytics 24 giờ | `appId` và `npx firebase-tools login` | Bật |
 | `rc` | Vận hành | Remote Config: version, tham số vừa đổi | `rcKey` và file key trong `rcKeyDir` | Bật |
+| `segsync` | Vận hành | Campaign mới tự thêm vào một segment, **có publish Remote Config** | `segmentSync`, app đó có `rcKey`, `rc.py` trong `rcKeyDir`, Databuckets | Tắt |
 | `market` | Vận hành | market-tool | market-tool chạy trên macOS của owner; người khác để tắt | Tắt |
 | `consoles` | Vận hành | Play Console vitals, AdMob | `bridge`, profile `falcon` (`playDev`) và `publisher` | Tắt |
 | `bridge` | Vận hành | Trạng thái extension; mở cổng 8788 cho extension | Extension đã nạp (`docs/setup.md` bước 8) | Tắt |

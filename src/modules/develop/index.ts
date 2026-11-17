@@ -8,8 +8,8 @@ import { REPOS } from '../../config.ts'
 import { ago, board, boardHead, cut, empty, esc, num, pill, section, TZ } from '../../core/html.ts'
 import { md } from '../../core/md.ts'
 import type { Alert, Module, Req, Res, Upload, View, Waiting } from '../../core/types.ts'
-import { ai, chromeOn, firstDiscussPrompt, modeLabel, modelChoice, modelName, parseMode, replyPrompt } from './prompts.ts'
-import { activity, addMessage, createTask, getFile, getTask, HAS_SIPS, initStore, listTasks, MAX_IMAGES, messages, openTurn, queueTurn, requestCancel, saveImages, setMode, setStatus, storable, takesReply, resolvedModels, composeState, type ComposeState,
+import { ai, chromeOn, firstDiscussPrompt, modeLabel, modelChoice, modelName, parseMode, replyPrompt, taskMessage } from './prompts.ts'
+import { activity, addMessage, commandsFor, compactedSince, CONTEXT_WARN, contextShare, createTask, getFile, getTask, HAS_SIPS, kTokens, initStore, listTasks, MAX_IMAGES, messages, openTurn, queueTurn, requestCancel, saveImages, setMode, setStatus, storable, takesReply, resolvedModels, composeState, type ComposeState,
   STATUS_LABEL, taskFiles, turns, type DevFile, type Message, type RunMode, type Task, type TaskStatus, type Turn } from './store.ts'
 
 const TONE: Record<TaskStatus, 'ok' | 'warn' | 'bad' | 'info' | 'mute'> = {
@@ -55,8 +55,11 @@ function card(v: View, t: Task) {
   const closed = t.status === 'done' || t.status === 'cancelled'
   const live = t.status === 'discussing' || t.status === 'working' ? liveLine(v, openTurn(v.db, t.id)) : ''
   const st = closed ? [] : lastSteps(v, t.id)
+  // owner 2026-11-16: the board says which open task is near its context limit
+  const share = closed || !ai.features.context ? null : contextShare(t)
+  const ctx = share != null && share >= CONTEXT_WARN ? pill('warn', `Context ${Math.round(share * 100)}%`) : ''
   return `<li><a class="tile develop-card" href="/develop/task/${t.id}#latest">
-    <span class="develop-card-top">${pill(TONE[t.status], STATUS_LABEL[t.status])}<span class="develop-id">#${t.id}</span></span>
+    <span class="develop-card-top"><span class="develop-card-pills">${pill(TONE[t.status], STATUS_LABEL[t.status])}${ctx}</span><span class="develop-id">#${t.id}</span></span>
     <strong class="develop-card-title">${esc(t.title)}</strong>${live}
     ${st.length ? `<span class="develop-card-steps">${progress(st)}<span>${st.filter(s => s.done).length}/${st.length} bước</span></span>` : ''}
     <span class="develop-card-meta"><span class="develop-repo">${esc(repoName(t.repo))}</span>${t.jira_key ? `<span class="tag">${esc(t.jira_key)}</span>` : ''}${t.model || t.effort || t.ultracode || t.chrome || t.isolated ? `<span class="develop-mode-tag">${esc(modeLabel(t, resolvedModels(v.db)))}</span>` : ''}
@@ -145,7 +148,7 @@ function composeNote(t: Task, state: ComposeState) {
   const now = state === 'waiting' ? 'Claude đọc tin ngay, việc chạy nền vẫn chạy tiếp.' : state === 'queued' ? 'Tin này đi cùng lượt sắp chạy.' : 'Claude đọc tin ngay sau bước đang chạy, không cần dừng.'
   return state === 'cancel' ? '' : `<p class="develop-hint">${now} "Duyệt và làm" và đổi chế độ chạy mở lại khi lượt này xong.</p>`
 }
-const placeholder = (state: ComposeState) => state === 'reply' ? 'Trả lời Claude' : 'Nói thêm với Claude'
+const placeholder = (state: ComposeState) => `${state === 'reply' ? 'Trả lời Claude' : 'Nói thêm với Claude'}${ai.features.commands ? ', / để chạy lệnh hay skill' : ''}`
 
 /** The reply box at the foot of the thread: it stays on screen while the thread scrolls (owner 2026-11-09). The text
  *  grows with what is typed; images, the run mode and the two buttons sit on one bar under it. One form for every
@@ -158,7 +161,8 @@ function composer(v: View, t: Task, state: ComposeState) {
   return `${off}<form class="develop-compose" method="post" action="/develop/task/${t.id}/send" enctype="multipart/form-data" data-state="${state}"${state === 'cancel' ? ' hidden' : ''}>${csrfField(v)}
     <button type="button" class="develop-newmsg" id="newmsg" hidden>Tin mới bên dưới</button>
     <div class="develop-compose-box"><div class="develop-compose-preview" id="compose-preview"></div>
-      <textarea id="compose-text" name="text" maxlength="20000" rows="2" aria-label="Trả lời Claude" placeholder="${placeholder(state)}" data-base="${placeholder(state)}"></textarea>
+      ${ai.features.commands ? '<ul class="develop-cmds" id="compose-cmds" role="listbox" aria-label="Lệnh và skill" hidden></ul><p class="develop-sr" id="compose-cmds-n" aria-live="polite"></p>' : ''}
+      <textarea id="compose-text" name="text" maxlength="20000" rows="2" aria-label="Trả lời Claude" placeholder="${placeholder(state)}" data-base="${placeholder(state)}"${ai.features.commands ? ' aria-autocomplete="list" aria-controls="compose-cmds" aria-expanded="false"' : ''}></textarea>
       <div class="develop-compose-bar">
         ${ai.features.images ? `<label class="develop-attach-btn" title="Đính kèm ảnh">${I_CLIP}<span>Ảnh</span><input type="file" name="images" accept="image/*" multiple data-max="${MAX_IMAGES}" data-preview="compose-preview" data-hint="compose-text"></label>` : ''}
         ${modeFields(t, v)}
@@ -175,6 +179,25 @@ function typing(v: View, open: Turn | undefined, state: ComposeState) {
     : state === 'waiting' ? 'Đang chờ việc chạy nền, xong sẽ báo ở đây' : last ? shortPaths(last.text) : 'Đang bắt đầu'
   const act = state === 'live' && !!last // a tool line ("$ git status") reads as code
   return `<div class="msg develop-typing" id="typing" role="status"><div class="who"><span>Claude</span></div><p><span class="develop-dots" aria-hidden="true"><i></i><i></i><i></i></span><span${act ? ' class="develop-typing-act"' : ''}>${esc(text)}</span></p></div>`
+}
+
+/** The session's context in the Trạng thái panel (plan §12): tokens in it of the model's size, a bar that warns from
+ *  CONTEXT_WARN, and Compact (it sends "/compact" like the reply box would). */
+function contextBlock(v: View, t: Task, open: Turn | undefined) {
+  if (!ai.features.context) return ''
+  const share = contextShare(t), closed = t.status === 'done' || t.status === 'cancelled'
+  const compacted = compactedSince(t)
+  const pct = share == null ? '' : `${Math.round(share * 100)}%`
+  const figure = compacted ? `<span>Vừa compact${t.context_used ? `, trước đó ${esc(kTokens(t.context_used))}` : ''}</span>`
+    : t.context_used == null ? '<span class="develop-hint">có số sau câu trả lời đầu tiên</span>'
+    : `<span class="develop-ctx-n">${esc(kTokens(t.context_used))}${t.context_window ? ` / ${esc(kTokens(t.context_window))}, ${pct}` : ''}</span>`
+  const warn = share != null && share >= CONTEXT_WARN
+  const btn = ai.features.compact && t.session_started && !closed
+    ? `<form method="post" action="/develop/task/${t.id}/send" class="develop-ctx-form">${csrfField(v)}<input type="hidden" name="mode" value="discuss"><input type="hidden" name="text" value="/compact"><button type="submit" class="ghost"${open ? ' disabled' : ''}>Compact</button></form>` : ''
+  return `<div class="develop-ctx"><div class="develop-ctx-head"><span class="label">Context</span>${figure}${btn}</div>
+    ${share != null ? `<progress class="develop-bar${warn ? ' develop-bar-warn' : ''}" value="${t.context_used}" max="${t.context_window}" aria-label="Context đã dùng ${pct}"></progress>` : ''}
+    ${warn ? '<p class="develop-hint">Gần đầy: Claude tự compact ở khoảng 83%. Compact ngay, hoặc gõ <code>/compact</code> kèm điều cần giữ.</p>' : ''}
+    ${btn && open ? '<p class="develop-hint">Compact được khi lượt đang chạy xong.</p>' : ''}</div>`
 }
 
 /** The task page's pieces, for the page and for /live (chat.js swaps them in as they change). */
@@ -198,6 +221,7 @@ function parts(v: View, t: Task) {
     ${open ? '<p class="develop-hint">Dừng lượt đang chạy trước khi đổi trạng thái.</p>' : ''}</form>`
   const sum = section('Trạng thái', `<div class="develop-sum-top">${pill(TONE[t.status], STATUS_LABEL[t.status])}<span class="develop-hint">cập nhật ${esc(ago(t.updated_at, v.now))}</span></div>
     <div class="develop-figs"><div><span class="label">Chi phí</span><span class="big">${usd(t.cost_usd)}</span></div><div><span class="label">Lượt Claude</span><span class="big">${ts.length}</span></div></div>
+    ${contextBlock(v, t, open)}
     <dl class="kv"><div><dt>Repo</dt><dd>${esc(repoName(t.repo))}</dd></div><div><dt>Chế độ</dt><dd>${esc(modeLabel(t, resolvedModels(v.db)))}</dd></div>${lastModel ? `<div><dt>Model lượt gần nhất</dt><dd title="${esc(lastModel)}">${esc(modelName(lastModel))}</dd></div>` : ''}${t.jira_key ? `<div><dt>Jira</dt><dd><span class="tag">${esc(t.jira_key)}</span></dd></div>` : ''}
     <div><dt>Tạo</dt><dd>${esc(ago(t.created_at, v.now))}</dd></div></dl>${wt}${close}`, '', 'status', { cls: 'develop-sum' })
 
@@ -229,7 +253,7 @@ function intParam(req: Req) { const id = Number(req.params.id); return Number.is
 /** First turn of a task. Its session has seen nothing yet, so every image attached so far goes with it. */
 function startDiscussion(v: View, id: number) {
   const t = getTask(v.db, id)!
-  queueTurn(v.db, id, 'discuss', firstDiscussPrompt(t, repoName(t.repo)), allFiles(v, id))
+  queueTurn(v.db, id, 'discuss', firstDiscussPrompt(t), allFiles(v, id))
 }
 const allFiles = (v: View, taskId: number) => taskFiles(v.db, taskId).map(f => f.id)
 
@@ -285,6 +309,7 @@ const CSS = String.raw`
 .develop-card { display: flex; flex-direction: column; gap: var(--space-xs); color: var(--ink) }
 .develop-card:focus-visible { border-radius: var(--radius-card) }
 .develop-card-top { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xs) }
+.develop-card-pills { display: flex; flex-wrap: wrap; gap: var(--space-2xs); min-width: 0 }
 .develop-id { color: var(--muted); font-size: var(--text-sm); font-variant-numeric: tabular-nums }
 .develop-card-title { font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden }
 .develop-card-live { display: flex; align-items: baseline; gap: var(--space-xs); font-size: var(--text-sm); color: var(--ink-2); min-width: 0 }
@@ -413,6 +438,17 @@ const CSS = String.raw`
   background: transparent; box-shadow: none; border-radius: var(--radius-card) var(--radius-card) 0 0; padding: var(--space-sm) var(--space-md) var(--space-2xs) }
 /* the box's ring is the focus mark for the text */
 .develop-compose-box textarea:focus-visible { outline-color: transparent; box-shadow: none }
+/* "/" suggestions: above the text, inside the box, so the box grows upwards from its place at the foot */
+.develop-cmds { list-style: none; margin: 0; padding: var(--space-2xs); display: grid; max-height: min(40vh, 24rem); overflow-y: auto; overscroll-behavior: contain; border-bottom: 1px solid var(--rule) }
+.develop-cmds[hidden] { display: none }
+.develop-sr { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap }
+.develop-cmds > li { display: grid; gap: var(--space-3xs); min-height: 44px; align-content: center; padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-inner); cursor: pointer; min-width: 0 }
+.develop-cmds > li[aria-selected="true"] { background: var(--accent-soft) }
+@media (hover: hover) { .develop-cmds > li:hover { background: var(--paper-3) } }
+.develop-cmd-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-xs); min-width: 0 }
+.develop-cmd-name b { font-family: var(--mono); font-weight: 600; overflow-wrap: anywhere }
+.develop-cmd-hint { color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere }
+.develop-cmd-desc { color: var(--ink-2); font-size: var(--text-sm); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden }
 @media (hover: hover) { .develop-compose-box textarea:hover { background: transparent } }
 .develop-compose-preview .develop-paste { padding: 0 var(--space-md) }
 .develop-compose-preview .develop-paste:has(.develop-imgs:not([hidden]), .develop-hint:not(:empty)) { padding-top: var(--space-sm) }
@@ -491,6 +527,14 @@ const CSS = String.raw`
 .develop-cmd { display: block; justify-self: stretch; font-size: var(--text-xs); line-height: 1.5; padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-inner);
   background: var(--paper-3); overflow-wrap: anywhere; user-select: all; -webkit-user-select: all }
 .develop-status-form { padding-top: var(--space-sm); border-top: 1px solid var(--rule) }
+.develop-ctx { display: grid; gap: var(--space-xs); padding-top: var(--space-sm); border-top: 1px solid var(--rule); min-width: 0 }
+.develop-ctx-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs) var(--space-sm) }
+.develop-ctx-n { font-variant-numeric: tabular-nums; font-weight: 600 }
+.develop-ctx-form { margin-left: auto }
+.develop-ctx .develop-hint { margin: 0 }
+.develop-bar-warn { color: var(--warn) }
+.develop-bar-warn::-webkit-progress-value { background: var(--warn) }
+.develop-bar-warn::-moz-progress-bar { background: var(--warn) }
 
 .develop-checks { list-style: none; margin: 0; padding: 0; display: grid }
 .develop-checks > li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-sm); align-items: start; padding: var(--space-xs) 0; border-top: 1px solid var(--rule); overflow-wrap: anywhere }
@@ -584,10 +628,17 @@ export const develop: Module = {
         // joining an open turn: that turn carries the task already, so just this message and its own images (review
         // 2026-11-09); `said` lets the runner word it for the session it joins (a note during an approved turn)
         const open = openTurn(v.db, t.id), joins = !!open || !!t.session_started
-        queueTurn(v.db, t.id, 'discuss', joins ? replyPrompt(said) : `${firstDiscussPrompt(t, repoName(t.repo))}\n\n${replyPrompt(said)}`, joins ? ids : send(ids), Date.now(), said)
+        // a command opens its message: before it, a session not started yet gets the task from the runner (taskPreamble)
+        queueTurn(v.db, t.id, 'discuss', joins || ai.isCommand(said) ? replyPrompt(said) : `${taskMessage(t)}\n\n${replyPrompt(said)}`, joins ? ids : send(ids), Date.now(), said)
         if (open?.kind === 'execute') setStatus(v.db, t.id, 'working') // still the approved turn's task: it stays in its column
       }
       return back(true)
+    } },
+    // the "/" suggestions of a task's reply box (chat.js asks once): what claude offers in its repo
+    { method: 'GET', path: '/develop/task/:id/commands', handle: (req, v): Res => {
+      const id = intParam(req), t = id ? getTask(v.db, id) : undefined
+      if (!t) return { json: [], status: 404 }
+      return { json: ai.features.commands ? commandsFor(v.db, t.repo).map(c => ({ ...c, description: cut(c.description, 140) })) : [] }
     } },
     { method: 'GET', path: '/develop/paste.js', handle: (): Res => ({ file: PASTE, type: 'text/javascript; charset=utf-8' }) },
     { method: 'GET', path: '/develop/chat.js', handle: (): Res => ({ file: CHAT, type: 'text/javascript; charset=utf-8' }) },

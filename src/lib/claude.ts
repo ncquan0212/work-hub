@@ -1,7 +1,7 @@
 // Everything that is specific to Claude Code, the AI that runs Develop tasks (config `ai: "claude"`).
 // Another AI = another file like this one; the contract and the probes it must pass: docs/architecture.md "Đổi AI".
-// What the rest of the hub uses: `features`, `DEFAULT_LABEL`, `binary`, `turnArgs`, `message`, `parse` (→ NeutralEvent),
-// `describeTool`. The runner (src/runner/runner.ts) sees the CLI's output only as NeutralEvents.
+// What the rest of the hub uses: `features`, `DEFAULT_LABEL`, `binary`, `turnArgs`, `message`, `isCommand`, `parse`
+// (→ NeutralEvent), `describeTool`. The runner (src/runner/runner.ts) sees the CLI's output only as NeutralEvents.
 // Owner 2026-11-09: full access, because a task can be analysis or a report, not only code. Every MCP server
 // (Databuckets with no cap), any command, no cost cap. A turn runs like the owner's own sessions: auto mode (its
 // classifier blocks what is risky), and the owner's and the repo's settings and CLAUDE.md (≤ 5 agents, git status
@@ -14,7 +14,7 @@
 // write outside allowed, `git push` denied. Not bypassPermissions: it would drop the classifier.
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { APPS, CHROME_BROWSERS, CHROME_NOTE, CODE, DATA, HOME, RC_DIR, rcKeyPath, REPOS } from '../config.ts'
+import { APPS, CHROME_BROWSERS, CHROME_NOTE, CODE, DATA, HOME, RC_DIR, rcKeyPath, REPOS, WORKTREES } from '../config.ts'
 import type { RunMode, Task } from '../modules/develop/store.ts'
 import { markerFile } from '../runner/chrome-guard.ts'
 
@@ -32,12 +32,21 @@ export type NeutralEvent =
   | { kind: 'jobs'; pending: number }      // background jobs still running
   // one turn inside the session ended. cost: the session's running total. text: the turn's reply when the end carries it
   | { kind: 'end'; ok: boolean; cost: number | null; subtype?: string; text?: string }
+  | { kind: 'context'; used: number; model: string } // tokens in the session's context now, by the model that answered
+  | { kind: 'window'; model: string; tokens: number } // that model's context size
+  | { kind: 'compact'; auto: boolean; before: number | null } // the conversation was summarised; before: tokens in context then
+  | { kind: 'local' }                      // a command the AI answered itself (no model call, and no ack: /context)
+  | { kind: 'commands'; list: Command[] }  // the commands and skills a message may start with (`/name args`)
+
+export type Command = { name: string; description: string; hint: string }
 
 /** What this AI offers; the Develop forms show a field only when it is here. */
 export const features = {
   // Chrome off on Windows until probed there: claude runs hooks in PowerShell when it finds no Git Bash, the guard's
   // command line does not parse there, and a hook that fails that way does not block (review 2026-11-11)
   images: true, effort: true, chrome: process.platform !== 'win32', background: true, cost: true,
+  // context in use and its size, /compact, and messages that start with a command or a skill (plan §12, probed 2026-11-16)
+  context: true, compact: true, commands: true,
   // keys are what --model gets. Haiku by full id: the `haiku` alias still means Haiku 4.5 (probe 2026-11-09; opus,
   // sonnet and fable resolve to Opus 5.5, Sonnet 5.5 and Fable 5.1)
   // Labels with the version each value resolved to (CLI 2.1.289, init event, 2026-11-10). They are the fallback: the page
@@ -146,19 +155,38 @@ const args = (t: Task, deny: string[], rules: string[]) => [
   // each stdin message comes back once claude takes it (isReplay): the runner keeps stdin open until all were answered
   '--disallowedTools', ...deny, '--output-format', 'stream-json', '--verbose', '--replay-user-messages',
 ]
+// Every main working tree in the config, and the task worktrees, by absolute path. A task may work in any of the repos
+// (owner 2026-11-16, plan §13): `Edit(./**)` alone covered only the task's own, and a discussion turn could write into
+// another one (probe 2026-11-16; the absolute rule stops it)
+const MAIN_TREES = REPOS.map(r => `Edit(${rulePath(resolve(r.repo))}/**)`)
+const ALL_WORKTREES = `Edit(${rulePath(resolve(WORKTREES))}/**)`
+
 /** The CLI arguments of one turn. `rules`: the AI-neutral system prompt every turn gets (prompts.ts SYSTEM_RULES).
- *  A discussion turn edits nothing: not the main tree (its cwd), not a worktree the task has. Also forgets the browser
+ *  A discussion turn edits nothing: no repo's main tree, no worktree. An execution turn edits any repo's main tree; one
+ *  in the task's own worktree only that worktree (the other repos have none: read-only). Also forgets the browser
  *  chosen in an earlier turn (chrome-guard.ts): the Mac's Chrome may have gone since. */
 export function turnArgs(t: Task, kind: 'discuss' | 'execute', rules: string[]) {
   rmSync(markerFile(t.session_id), { force: true })
-  return args(t, kind === 'discuss' ? ['Edit(./**)', ...(t.worktree ? [`Edit(${rulePath(t.worktree)}/**)`] : []), ...DENY] : DENY, rules)
+  const edits = kind === 'discuss' ? ['Edit(./**)', ...MAIN_TREES, ALL_WORKTREES, ...(t.worktree ? [`Edit(${rulePath(t.worktree)}/**)`] : [])]
+    : t.isolated ? MAIN_TREES : []
+  return args(t, [...edits, ...DENY], rules)
 }
 
-/** The turn's prompt, and the images the owner attached to it, as the stream-json line written to claude's stdin. */
+/** A message claude runs as a command or a skill: `/name` first, then a space or nothing (`/code-review high`, `/compact`).
+ *  claude only does so when the message starts with it, so such a message goes in as it is (prompts.ts). A path is text:
+ *  `/Users/me/a.kt lỗi` has a `/` after the name. */
+export const isCommand = (text: string) => /^\/[A-Za-z0-9][\w:.-]*(\s|$)/.test(text.trimStart())
+
+/** The turn's prompt, and the images the owner attached to it, as the stream-json line written to claude's stdin. The
+ *  text goes last: claude reads a command only from the last block (probe 2026-11-16: "/context" before an image went to
+ *  the model as text, after it ran). */
 export const message = (prompt: string, images: { mime: string; data: Buffer }[] = []) => JSON.stringify({ type: 'user', message: { role: 'user',
-  content: images.length ? [{ type: 'text', text: prompt }, ...images.map(i => ({ type: 'image', source: { type: 'base64', media_type: i.mime, data: i.data.toString('base64') } }))] : prompt } }) + '\n'
+  content: images.length ? [...images.map(i => ({ type: 'image', source: { type: 'base64', media_type: i.mime, data: i.data.toString('base64') } })), { type: 'text', text: prompt }] : prompt } }) + '\n'
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
+// init's terminal_slash_commands (CLI 2.1.289): they need the interactive terminal, so the page does not offer them
+const TERMINAL_ONLY = new Set(['doctor', 'color', 'focus', 'reload-plugins'])
+const tokens = (u: any) => ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'].reduce((n, k) => n + (Number(u?.[k]) || 0), 0)
 /** One line of claude's stream-json output as NeutralEvents. */
 export function parse(line: string): NeutralEvent[] {
   let o: any; try { o = JSON.parse(line) } catch { return [] }
@@ -178,11 +206,30 @@ export function parse(line: string): NeutralEvent[] {
       return c?.type === 'text' && typeof c.text === 'string' ? [{ kind: 'text', text: c.text }] : []
     })
     ev.push(...(said.length ? said : [{ kind: 'text', text: '' } as const])) // a thinking block still means Claude is at it
+    // what this call sent the model is what the context holds now. Not a subagent's call (parent_tool_use_id), nor a
+    // local command's output (model <synthetic>, usage 0: /context). Probe 2026-11-16: 45,010 here, /context "45k / 200k"
+    // a local command's answer (local_command_source): the command is never echoed, this stands for it (runner)
+    if (o.local_command_source != null && !o.parent_tool_use_id) ev.push({ kind: 'local' })
+    const used = tokens(o.message?.usage)
+    if (!o.parent_tool_use_id && used > 0 && typeof o.message?.model === 'string' && o.message.model !== '<synthetic>') ev.push({ kind: 'context', used, model: o.message.model })
   }
+  // /compact (auto: claude did it itself, the context being nearly full). pre_tokens is the whole context then; post_tokens
+  // counts the conversation only, not the system prompt and tools, so it is not "the context after" (probe: 45,102 / 3,997)
+  if (o.type === 'system' && o.subtype === 'compact_boundary') {
+    const m = o.compact_metadata ?? {}
+    ev.push({ kind: 'compact', auto: m.trigger === 'auto', before: Number.isFinite(Number(m.pre_tokens)) && m.pre_tokens != null ? Number(m.pre_tokens) : null })
+  }
+  // every process says what it offers, with descriptions, before the first turn (init lists the names only)
+  if (o.type === 'system' && o.subtype === 'commands_changed' && Array.isArray(o.commands))
+    ev.push({ kind: 'commands', list: o.commands.filter((c: any) => typeof c?.name === 'string' && c.name && !TERMINAL_ONLY.has(c.name))
+      .map((c: any) => ({ name: String(c.name), description: String(c.description ?? '').replace(/\s+/g, ' ').trim(), hint: String(c.argumentHint ?? '') })) })
   if (o.type === 'system' && o.subtype === 'background_tasks_changed') ev.push({ kind: 'jobs', pending: o.tasks?.length ?? 0 })
   // one result per turn inside the session: a turn that started a background job ends with "started", and the job's
   // completion starts another turn. total_cost_usd is the session's running total: background agents included (probe
   // 2026-11-09: 0.41 then 0.67), and every earlier turn too, since --resume restores it (task #3: 2.11, 2.54, 6.55, 7.04, 7.66)
+  // each model's context size: the turn's model, and the small one claude uses on the side (titles)
+  if (o.type === 'result') for (const [model, u] of Object.entries(o.modelUsage ?? {}) as [string, any][])
+    if (Number(u?.contextWindow) > 0) ev.push({ kind: 'window', model, tokens: Number(u.contextWindow) })
   if (o.type === 'result') ev.push({ kind: 'end', ok: !o.is_error, cost: o.total_cost_usd == null ? null : Number(o.total_cost_usd),
     subtype: o.subtype == null ? undefined : String(o.subtype), text: o.result == null ? undefined : String(o.result) })
   return ev

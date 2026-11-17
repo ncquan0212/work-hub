@@ -120,6 +120,17 @@ máy có bàn phím (Shift+Enter xuống dòng; bàn phím cảm ứng thì Ente
 soạn dấu), gửi bằng `fetch` (`/send?js=1` trả `{ok, why}`), hỏi `/develop/task/:id/live?after=<id>` mỗi 2 giây khi có lượt
 (15 giây khi không) để thêm tin mới, bong bóng "Claude đang…" (`#typing`), thay panel `#live`, `#status`, `#steps`; theo tin
 mới khi đang ở cuối, không thì hiện nút "Tin mới bên dưới"; giữ nháp trong `localStorage`; nút "Chép" trên tin của Claude.
+Gõ `/` ở đầu ô: danh sách lệnh và skill (`#compose-cmds`, `role=listbox`, nằm trong khung, trên ô chữ, nên khung cao dần
+lên từ chỗ của nó). Danh sách lấy một lần từ `/develop/task/:id/commands` và lọc theo chữ đang gõ, tối đa 8 dòng; mỗi
+dòng cao ít nhất 44px, gồm tên, gợi ý tham số và mô tả (2 dòng). Trên bàn phím: mũi tên chọn, Enter hoặc Tab chèn, Esc
+đóng. Trên điện thoại: chạm để chèn; không có dòng nào được chọn sẵn, nên Enter vẫn là xuống dòng. Ô chữ không báo được là
+danh sách đã mở, nên một dòng ẩn `aria-live="polite"` (`#compose-cmds-n`, `.develop-sr`) đọc "N lệnh. Mũi tên hoặc chạm để
+chọn". Cmd/Ctrl+Enter vẫn gửi, kể cả khi danh sách đang mở.
+
+**Context của task** (D25): ở khung Trạng thái, dưới hai số Chi phí và Lượt Claude. Gồm số "45k / 200k, 23%", thanh
+`progress.develop-bar` (màu cảnh báo `--warn` từ 75%, `develop-bar-warn`) và nút viền "Compact" (gửi `/compact`, khoá khi
+có lượt đang chạy). Vừa compact thì ghi "Vừa compact, trước đó X", không có thanh. Thẻ task ở bảng có nhãn cảnh báo
+"Context N%" cạnh nhãn trạng thái khi từ 75% trở lên.
 
 **Hội thoại:** `.msg` cho tin của Claude, `.msg.me` cho tin của bạn (căn phải, nền tím nhạt), `.who` là dòng
 người gửi.

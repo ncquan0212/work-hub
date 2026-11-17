@@ -16,6 +16,7 @@ import { notifyModule } from './modules/notify/index.ts'
 import { rc } from './modules/rc.ts'
 import { repos } from './modules/repos.ts'
 import { report } from './modules/report/index.ts'
+import { segsync } from './modules/segsync.ts'
 import { track } from './modules/track/index.ts'
 
 export const MODULES: Module[] = [
@@ -31,6 +32,7 @@ export const MODULES: Module[] = [
   repos,
   crash,
   rc,
+  segsync,
   market,
   consoles,
   bridge,

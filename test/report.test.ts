@@ -81,6 +81,8 @@ test('Databuckets reply: several results; EQL rewrites that are only cosmetic st
   assert.equal(r.length, 2)
   assert.equal(normEql(r[1].eql!), normEql('select b from Y'))
   assert.notEqual(normEql('select a from X since 3 days ago'), normEql('select a from X since 4 days ago'))
+  // a reply without the block says what the agent answered, for runEql and Theo dõi's askAll alike
+  assert.throws(() => parseQueryResults('**Query results**\n```\napp_id | users\n(no rows returned)\n```'), /không có khối Query results\. Agent trả lời: ".*no rows returned/)
 })
 
 test('bigChart: labels in %, the latest day always labelled, the end value, a fixed-size rug', async () => {

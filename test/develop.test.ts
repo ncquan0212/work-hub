@@ -130,3 +130,51 @@ test('runner main: exits with a message when Develop is off in the config', () =
     assert.deepEqual(readdirSync(dir), ['config.json'], 'no hub.db opened')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('claude: context, its size, compact and the commands, from lines as probed (2026-11-16)', () => {
+  const p = (o: unknown) => parse(JSON.stringify(o))
+  const usage = { input_tokens: 2, cache_creation_input_tokens: 45008, cache_read_input_tokens: 0, output_tokens: 4 }
+  assert.deepEqual(p({ type: 'assistant', parent_tool_use_id: null, message: { model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'hi' }], usage } }),
+    [{ kind: 'text', text: 'hi' }, { kind: 'context', used: 45010, model: 'claude-haiku-5-5' }])
+  assert.deepEqual(p({ type: 'assistant', parent_tool_use_id: 'toolu_1', message: { model: 'claude-haiku-5-5', content: [], usage } }), [{ kind: 'text', text: '' }], "a subagent's call is not the session's context")
+  assert.deepEqual(p({ type: 'assistant', parent_tool_use_id: null, local_command_source: '<local-command-stdout>## Context', message: { model: '<synthetic>', content: [{ type: 'text', text: '## Context Usage' }], usage: { input_tokens: 0 } } }),
+    [{ kind: 'text', text: '## Context Usage' }, { kind: 'local' }], "a local command's answer: no context figure, it stands for the ack")
+  assert.deepEqual(p({ type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.36, result: 'hi',
+    modelUsage: { 'claude-haiku-4-5-20251001': { contextWindow: 200000 }, 'claude-haiku-5-5': { contextWindow: 200000, maxOutputTokens: 128000 } } }).filter(e => e.kind === 'window'),
+    [{ kind: 'window', model: 'claude-haiku-4-5-20251001', tokens: 200000 }, { kind: 'window', model: 'claude-haiku-5-5', tokens: 200000 }])
+  assert.deepEqual(p({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'manual', pre_tokens: 45102, post_tokens: 3997 } }), [{ kind: 'compact', auto: false, before: 45102 }])
+  assert.deepEqual(p({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto' } }), [{ kind: 'compact', auto: true, before: null }])
+  assert.deepEqual(p({ type: 'system', subtype: 'commands_changed', commands: [{ name: 'compact', description: 'Free up\n context', argumentHint: '<instructions>', builtin: true }, { name: 'doctor', description: 'x' }, { description: 'no name' }] }),
+    [{ kind: 'commands', list: [{ name: 'compact', description: 'Free up context', hint: '<instructions>' }] }])
+})
+
+test('commands go in as they are, the rest framed as the owner\'s words; the turn\'s rules are in its system prompt', async () => {
+  const { isCommand } = await import('../src/lib/claude.ts')
+  for (const s of ['/compact', '/code-review high', '  /context', '/ponytail:ponytail-review', '/compact\ngiữ quyết định']) assert.ok(isCommand(s), s)
+  for (const s of ['/Users/me/a.kt lỗi ở đây', 'xem /context', '/', '// comment', '/-x']) assert.ok(!isCommand(s), s)
+  const { executeNote, executePrompt, firstDiscussPrompt, replyPrompt, taskPreamble, turnRules } = await import('../src/modules/develop/prompts.ts')
+  const t = { id: 7, title: 'Dọn code', body: 'Màn paywall', jira_key: null, session_started: 1, isolated: 0, worktree: null, branch: null } as unknown as Parameters<typeof turnRules>[0]
+  assert.equal(replyPrompt('/simplify'), '/simplify'); assert.equal(executeNote('/compact'), '/compact'); assert.equal(executePrompt(t, ' /simplify '), '/simplify')
+  assert.match(replyPrompt('chào'), /^Owner trả lời[^]*"""\nchào\n"""/)
+  assert.match(executePrompt(t, ''), /Owner đã DUYỆT/)
+  assert.match(executePrompt({ ...t, session_started: 0 }, 'nhanh'), /Màn paywall[^]*Owner đã DUYỆT[^]*nhanh/, 'a session that never saw the task gets it')
+  assert.equal(firstDiscussPrompt({ ...t, body: '/code-review high' }), '/code-review high')
+  assert.match(firstDiscussPrompt(t), /^Task #7: Dọn code[^]*Màn paywall/)
+  assert.match(taskPreamble(t), /Màn paywall[^]*Tin kế tiếp là lệnh/)
+  // the task's repo first, the others with their paths (owner 2026-11-16, plan §13)
+  const repos = [{ key: 'xr', name: 'XRemote', repo: '/c/xr' }, { key: 'xc', name: 'XCast', repo: '/c/xc' }], tx = { ...t, repo: 'xr' }
+  const [discuss] = turnRules(tx, 'discuss', repos), [execute] = turnRules(tx, 'execute', repos)
+  const [iso] = turnRules({ ...tx, isolated: 1, worktree: '/w/xr-task7', branch: 'hub/task-7' }, 'execute', repos)
+  assert.match(discuss, /Task #7[^]*Repo chính của task: XRemote[^]*- XCast: \/c\/xc[^]*đừng đề nghị tách task[^]*CLAUDE\.md[^]*TRAO ĐỔI/)
+  assert.doesNotMatch(discuss, /THỰC HIỆN\./); assert.doesNotMatch(discuss, /- XRemote:/, 'the own repo is not among the others')
+  assert.match(discuss, /"- \[ \] XCast: …"/, 'a checklist across repos names the repo of each step')
+  assert.match(execute, /Sửa repo khác chỉ khi việc đã duyệt có nhắc[^]*mỗi repo định sửa, chạy git status/)
+  assert.match(iso, /worktree riêng của task: \/w\/xr-task7[^]*Repo khác chỉ đọc/)
+  assert.doesNotMatch(turnRules({ ...tx }, 'discuss', [repos[0]])[0], /Các repo khác/, 'one repo: nothing about others')
+  assert.match(execute, /THỰC HIỆN[^]*git status[^]*Không push/); assert.match(execute, /\/tên là lệnh/)
+  assert.doesNotMatch(discuss + execute, /Màn paywall|Dọn code/, 'title and description stay out of the system prompt: they may be Jira text')
+  // with images, the text goes last: claude reads a command only from the last block (probe 2026-11-16)
+  const { message } = await import('../src/lib/claude.ts')
+  const line = JSON.parse(message('/code-review high', [{ mime: 'image/png', data: Buffer.from('x') }]))
+  assert.deepEqual(line.message.content.map((b: { type: string }) => b.type), ['image', 'text']); assert.equal(line.message.content.at(-1).text, '/code-review high')
+})
